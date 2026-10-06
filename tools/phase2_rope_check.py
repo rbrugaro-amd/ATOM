@@ -1,6 +1,8 @@
 """Compare the rope ATOM builds for the DFlash draft against the reference's cos/sin."""
 
-import math, torch
+import math
+
+import torch
 from aiter.rotary_embedding import get_rope
 
 # Exactly what KimiK3DFlashAttention.__init__ does for this checkpoint.
@@ -28,7 +30,7 @@ for a in ("mscale", "scaling_factor", "attn_factor", "base", "rotary_dim"):
     if hasattr(emb, a):
         print(f"  {a} = {getattr(emb, a)}")
 expected = 0.1 * math.log(16.0) + 1.0
-print(f"\nreference attention_scaling = 1.2772588722239782")
+print("\nreference attention_scaling = 1.2772588722239782")
 print(f"0.1*ln(16)+1                = {expected!r}")
 got = getattr(emb, "mscale", None)
 print(f"ATOM rope mscale            = {got!r}")

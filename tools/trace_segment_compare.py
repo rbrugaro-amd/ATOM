@@ -7,8 +7,14 @@ the draft step, and reading the CPU one as GPU cost is how `propose_dspark` got
 reported as 157 us when it is really 889 us on device.
 """
 
-import gzip, json, glob, re, sys, bisect
+import bisect
+import glob
+import gzip
+import json
+import re
+import sys
 from collections import defaultdict
+from itertools import pairwise
 
 SEGMENTS = [
     "ATOM::prepare_model",
@@ -64,7 +70,7 @@ def gap_analysis(ev, min_gap=20.0):
     rts = [e["ts"] for e in rt]
 
     gaps, busy = [], sum(k["dur"] for k in ks)
-    for a, b in zip(ks, ks[1:]):
+    for a, b in pairwise(ks):
         g = b["ts"] - (a["ts"] + a["dur"])
         if g >= min_gap:
             gaps.append((a["ts"] + a["dur"], g, a["name"], b["name"]))
@@ -77,9 +83,12 @@ def gap_analysis(ev, min_gap=20.0):
         i = bisect.bisect_right(cts, t1)
         inner = None
         for e in cpu[max(0, i - 400) : i]:  # innermost (shortest) enclosing annotation
-            if e["ts"] <= t0 and e["ts"] + e["dur"] >= t1:
-                if inner is None or e["dur"] < inner["dur"]:
-                    inner = e
+            if (
+                e["ts"] <= t0
+                and e["ts"] + e["dur"] >= t1
+                and (inner is None or e["dur"] < inner["dur"])
+            ):
+                inner = e
         attrib[
             (
                 re.sub(r"\[.*?\]", "[..]", inner["name"])
@@ -97,14 +106,20 @@ def gap_analysis(ev, min_gap=20.0):
         j = bisect.bisect_right(rts, t1)
         best = None
         for e in rt[max(0, j - 400) : j]:
-            if e["ts"] <= t0 + g * 0.5 <= e["ts"] + e["dur"]:
-                if best is None or e["dur"] > best["dur"]:
-                    best = e
+            if e["ts"] <= t0 + g * 0.5 <= e["ts"] + e["dur"] and (
+                best is None or e["dur"] > best["dur"]
+            ):
+                best = e
         runtime[best["name"] if best else "<none>"][0] += 1
         runtime[best["name"] if best else "<none>"][1] += g
-    return dict(
-        tid=tid, span=span, busy=busy, gaps=gaps, attrib=attrib, runtime=runtime
-    )
+    return {
+        "tid": tid,
+        "span": span,
+        "busy": busy,
+        "gaps": gaps,
+        "attrib": attrib,
+        "runtime": runtime,
+    }
 
 
 if __name__ == "__main__":
