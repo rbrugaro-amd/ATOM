@@ -530,11 +530,29 @@ class DSparkProposer(Drafter):
                 hidden_size=self.config.hf_config.hidden_size,
                 extract=self._extract_layer_hidden,
             )
-        # EXPERIMENT-ONLY, both default OFF. See _arm_k3_aux_aggregate.
-        #   ATOM_K3_AUX_PROBE=1     -- measure prefix-vs-aggregate, feed prefix.
-        #   ATOM_K3_AUX_AGGREGATE=1 -- feed the AGGREGATE to the draft instead.
+        # Kimi-K3's residual stream is a BANK of per-12-layer snapshots plus a
+        # running prefix, recombined by a softmax mixture. The raw wire carries
+        # only the current block's prefix. A draft trained by SpecForge against
+        # a live SGLang target was trained on the MIXTURE (SGLang's dspark aux
+        # tap calls `aggregate_stream`), so feeding it the raw prefix feeds it a
+        # feature it never saw. Measured on GSM8K n=1319 at k=5: acceptance
+        # 55.61% -> 62.04%, +6.43 pp, accuracy unchanged within noise.
+        #
+        # DEFAULT ON. It is gated only so it can be turned OFF for an A/B; an
+        # unset env must NOT silently select the worse feature, which is what a
+        # default-off flag does in CI -- the run would score ~55.6% and look
+        # exactly like the patches never applied. Every DCP8 number on this
+        # branch was measured with the aggregate ON.
+        #
+        # Correctly, the same flag makes a vLLM/HF-trained draft (e.g.
+        # Inferact/Kimi-K3-DSpark, `_torchspec_version` in its config) WORSE by
+        # ~2.6 pp -- that draft wants the raw prefix. Routing this by draft
+        # PROVENANCE rather than a global default is the open design question;
+        # until then set ATOM_K3_AUX_AGGREGATE=0 for such a draft.
+        #   ATOM_K3_AUX_AGGREGATE=0 -- feed the RAW PREFIX (pre-fix behaviour).
+        #   ATOM_K3_AUX_PROBE=1     -- additionally log prefix-vs-aggregate cos.
         report = os.getenv("ATOM_K3_AUX_PROBE", "0") == "1"
-        feed_aggregate = os.getenv("ATOM_K3_AUX_AGGREGATE", "0") == "1"
+        feed_aggregate = os.getenv("ATOM_K3_AUX_AGGREGATE", "1") == "1"
         if report or feed_aggregate:
             spec = self._arm_k3_aux_aggregate(
                 target_model, spec, report=report, feed_aggregate=feed_aggregate

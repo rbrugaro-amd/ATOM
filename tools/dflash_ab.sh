@@ -144,10 +144,13 @@ fi
 if [[ "${ATOM_K3_AUX_PROBE:-0}" == "1" ]]; then
   EXTRA_ENVS+=(-e "ATOM_K3_AUX_PROBE=1")
 fi
-# BEHAVIOURAL (falsifier arm): feed the draft the K3 aggregate stream instead
-# of the raw block prefix. See RESUME.md "rung 0 step 2".
-if [[ "${ATOM_K3_AUX_AGGREGATE:-0}" == "1" ]]; then
-  EXTRA_ENVS+=(-e "ATOM_K3_AUX_AGGREGATE=1")
+# BEHAVIOURAL: feed the draft the K3 aggregate stream instead of the raw block
+# prefix. DEFAULT ON in the code, so forward whatever the host SET -- including
+# "0". Testing for == "1" here would silently drop `ATOM_K3_AUX_AGGREGATE=0`
+# (nothing forwarded -> container falls back to its default ON), which would
+# make the inferact arm unmeasurable and the A/B one-directional.
+if [[ -n "${ATOM_K3_AUX_AGGREGATE+set}" ]]; then
+  EXTRA_ENVS+=(-e "ATOM_K3_AUX_AGGREGATE=${ATOM_K3_AUX_AGGREGATE}")
 fi
 PROFILE_ARGS=""
 if [[ "$WORKLOAD" == "trace" ]]; then
