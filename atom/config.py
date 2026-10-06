@@ -2276,19 +2276,41 @@ class Config:
                 # construction: its cache is one latent row per token,
                 # replicated across TP, so DCP's token shard is the only shard.
                 #
-                # Every OTHER non-MLA draft (Eagle3-llama, a plain GQA
-                # speculator) double-shards and produces garbage with NO error
-                # and NO fault -- the only symptom is lost acceptance length.
-                # Refuse it rather than ship that.
+                # Every OTHER such draft (Eagle3-llama, a plain GQA speculator)
+                # double-shards and produces garbage with NO error and NO fault
+                # -- the only symptom is lost acceptance length. Refuse it.
+                #
+                # KEY ON OWNERSHIP OF A POOL, NOT ON THE FAMILY NAME. An earlier
+                # version tested `attn_family(draft_hf) is not Family.MLA` and
+                # refused every working MTP + DCP config in the tree: for
+                # `--method mtp` the draft hf config IS the target's, and
+                # `attn_family` returns the target's family -- KIMI_MLA, V4 or
+                # CSA2 -- never `Family.MLA`, which `selector.py` only reaches
+                # after every earlier family test has already failed. That
+                # rejected e.g. `recipes/Agentic-GLM-5.2.md`'s documented
+                # `--method mtp --decode-context-parallel-size 4`.
+                #
+                # `DRAFT_OWNS_KV_POOL` is the mechanism itself rather than a
+                # proxy for it: a draft that owns a SIBLING pool is the one
+                # sharded on the head axis. Latent-KV drafts share the target's
+                # cache, own no pool, and are immune. Same helper
+                # `kv_transfer/offload/mp/deployment.py:182` already uses.
                 from atom.spec_decode.draft_kv import needs_non_causal_kv
-                from atom.utils.selector import Family, attn_family
+                from atom.utils.selector import attn_family, get_attn_backend
 
                 draft_hf = self.speculative_config.draft_model_hf_config
-                if draft_hf is not None and attn_family(draft_hf) is not Family.MLA:
-                    assert needs_non_causal_kv(draft_hf), (
+                owns_sibling_pool = draft_hf is not None and bool(
+                    get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
+                )
+                if owns_sibling_pool and not needs_non_causal_kv(draft_hf):
+                    # `raise`, not `assert`: `python -O` strips asserts, and a
+                    # stripped guard restores exactly the silent mis-shard this
+                    # exists to prevent.
+                    raise ValueError(
                         "Decode context parallel (--decode-context-parallel-size "
                         f"{self.decode_context_parallel_size}) with a non-MLA "
-                        "draft is only supported for the DFlash block drafter, "
+                        "draft that owns its own KV pool is only supported for the "
+                        "DFlash block drafter, "
                         "which replicates its KV heads across the DCP group and "
                         "merges the per-rank partial softmaxes. This draft "
                         f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
