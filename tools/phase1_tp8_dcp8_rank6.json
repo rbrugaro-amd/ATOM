@@ -1,0 +1,1234 @@
+{
+ "geometry": {
+  "hd": 64,
+  "nq": 64,
+  "nkv": 16,
+  "inter": 14336,
+  "hidden": 7168,
+  "nlayers": 5,
+  "q_sh": 4096,
+  "kv_sh": 1024,
+  "o_sh": 512,
+  "i_sh": 1792,
+  "tp_rank": 6,
+  "tp_size": 8,
+  "dcp": 8,
+  "tp_eff": 1,
+  "qkv_rank": 0
+ },
+ "coverage": {
+  "n_params": 45,
+  "n_loaded": 45,
+  "dropped": [],
+  "unloaded": []
+ },
+ "checks": [
+  [
+   "L0.qkv.shape",
+   true,
+   "got (6144, 7168) want (6144, 7168)"
+  ],
+  [
+   "L0.qkv.q",
+   true,
+   ""
+  ],
+  [
+   "L0.qkv.k",
+   true,
+   ""
+  ],
+  [
+   "L0.qkv.v",
+   true,
+   ""
+  ],
+  [
+   "L0.qkv.blockmatch",
+   true,
+   "q->[0] k->[0] v->[0]"
+  ],
+  [
+   "L0.qkv.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=True"
+  ],
+  [
+   "L0.o.shape",
+   true,
+   "got (7168, 512) want (7168, 512)"
+  ],
+  [
+   "L0.o.colshard",
+   true,
+   ""
+  ],
+  [
+   "L0.o.colmatch",
+   true,
+   "o_proj cols match rank(s) [6]; q heads are rank 6"
+  ],
+  [
+   "L0.gate_up.shape",
+   true,
+   "got (3584, 7168) want (3584, 7168)"
+  ],
+  [
+   "L0.gate_up.gate",
+   true,
+   ""
+  ],
+  [
+   "L0.gate_up.up",
+   true,
+   ""
+  ],
+  [
+   "L0.gate_up.blockmatch",
+   true,
+   "g->[6] u->[6]"
+  ],
+  [
+   "L0.gate_up.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=False"
+  ],
+  [
+   "L0.gate_up.ALT_gate_duplicated",
+   true,
+   "matched=False"
+  ],
+  [
+   "L0.down.shape",
+   true,
+   "got (7168, 1792) want (7168, 1792)"
+  ],
+  [
+   "L0.down.colshard",
+   true,
+   ""
+  ],
+  [
+   "L0.down.colmatch",
+   true,
+   "->[6]"
+  ],
+  [
+   "L1.qkv.shape",
+   true,
+   "got (6144, 7168) want (6144, 7168)"
+  ],
+  [
+   "L1.qkv.q",
+   true,
+   ""
+  ],
+  [
+   "L1.qkv.k",
+   true,
+   ""
+  ],
+  [
+   "L1.qkv.v",
+   true,
+   ""
+  ],
+  [
+   "L1.qkv.blockmatch",
+   true,
+   "q->[0] k->[0] v->[0]"
+  ],
+  [
+   "L1.qkv.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=True"
+  ],
+  [
+   "L1.o.shape",
+   true,
+   "got (7168, 512) want (7168, 512)"
+  ],
+  [
+   "L1.o.colshard",
+   true,
+   ""
+  ],
+  [
+   "L1.o.colmatch",
+   true,
+   "o_proj cols match rank(s) [6]; q heads are rank 6"
+  ],
+  [
+   "L1.gate_up.shape",
+   true,
+   "got (3584, 7168) want (3584, 7168)"
+  ],
+  [
+   "L1.gate_up.gate",
+   true,
+   ""
+  ],
+  [
+   "L1.gate_up.up",
+   true,
+   ""
+  ],
+  [
+   "L1.gate_up.blockmatch",
+   true,
+   "g->[6] u->[6]"
+  ],
+  [
+   "L1.gate_up.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=False"
+  ],
+  [
+   "L1.gate_up.ALT_gate_duplicated",
+   true,
+   "matched=False"
+  ],
+  [
+   "L1.down.shape",
+   true,
+   "got (7168, 1792) want (7168, 1792)"
+  ],
+  [
+   "L1.down.colshard",
+   true,
+   ""
+  ],
+  [
+   "L1.down.colmatch",
+   true,
+   "->[6]"
+  ],
+  [
+   "L2.qkv.shape",
+   true,
+   "got (6144, 7168) want (6144, 7168)"
+  ],
+  [
+   "L2.qkv.q",
+   true,
+   ""
+  ],
+  [
+   "L2.qkv.k",
+   true,
+   ""
+  ],
+  [
+   "L2.qkv.v",
+   true,
+   ""
+  ],
+  [
+   "L2.qkv.blockmatch",
+   true,
+   "q->[0] k->[0] v->[0]"
+  ],
+  [
+   "L2.qkv.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=True"
+  ],
+  [
+   "L2.o.shape",
+   true,
+   "got (7168, 512) want (7168, 512)"
+  ],
+  [
+   "L2.o.colshard",
+   true,
+   ""
+  ],
+  [
+   "L2.o.colmatch",
+   true,
+   "o_proj cols match rank(s) [6]; q heads are rank 6"
+  ],
+  [
+   "L2.gate_up.shape",
+   true,
+   "got (3584, 7168) want (3584, 7168)"
+  ],
+  [
+   "L2.gate_up.gate",
+   true,
+   ""
+  ],
+  [
+   "L2.gate_up.up",
+   true,
+   ""
+  ],
+  [
+   "L2.gate_up.blockmatch",
+   true,
+   "g->[6] u->[6]"
+  ],
+  [
+   "L2.gate_up.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=False"
+  ],
+  [
+   "L2.gate_up.ALT_gate_duplicated",
+   true,
+   "matched=False"
+  ],
+  [
+   "L2.down.shape",
+   true,
+   "got (7168, 1792) want (7168, 1792)"
+  ],
+  [
+   "L2.down.colshard",
+   true,
+   ""
+  ],
+  [
+   "L2.down.colmatch",
+   true,
+   "->[6]"
+  ],
+  [
+   "L3.qkv.shape",
+   true,
+   "got (6144, 7168) want (6144, 7168)"
+  ],
+  [
+   "L3.qkv.q",
+   true,
+   ""
+  ],
+  [
+   "L3.qkv.k",
+   true,
+   ""
+  ],
+  [
+   "L3.qkv.v",
+   true,
+   ""
+  ],
+  [
+   "L3.qkv.blockmatch",
+   true,
+   "q->[0] k->[0] v->[0]"
+  ],
+  [
+   "L3.qkv.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=True"
+  ],
+  [
+   "L3.o.shape",
+   true,
+   "got (7168, 512) want (7168, 512)"
+  ],
+  [
+   "L3.o.colshard",
+   true,
+   ""
+  ],
+  [
+   "L3.o.colmatch",
+   true,
+   "o_proj cols match rank(s) [6]; q heads are rank 6"
+  ],
+  [
+   "L3.gate_up.shape",
+   true,
+   "got (3584, 7168) want (3584, 7168)"
+  ],
+  [
+   "L3.gate_up.gate",
+   true,
+   ""
+  ],
+  [
+   "L3.gate_up.up",
+   true,
+   ""
+  ],
+  [
+   "L3.gate_up.blockmatch",
+   true,
+   "g->[6] u->[6]"
+  ],
+  [
+   "L3.gate_up.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=False"
+  ],
+  [
+   "L3.gate_up.ALT_gate_duplicated",
+   true,
+   "matched=False"
+  ],
+  [
+   "L3.down.shape",
+   true,
+   "got (7168, 1792) want (7168, 1792)"
+  ],
+  [
+   "L3.down.colshard",
+   true,
+   ""
+  ],
+  [
+   "L3.down.colmatch",
+   true,
+   "->[6]"
+  ],
+  [
+   "L4.qkv.shape",
+   true,
+   "got (6144, 7168) want (6144, 7168)"
+  ],
+  [
+   "L4.qkv.q",
+   true,
+   ""
+  ],
+  [
+   "L4.qkv.k",
+   true,
+   ""
+  ],
+  [
+   "L4.qkv.v",
+   true,
+   ""
+  ],
+  [
+   "L4.qkv.blockmatch",
+   true,
+   "q->[0] k->[0] v->[0]"
+  ],
+  [
+   "L4.qkv.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=True"
+  ],
+  [
+   "L4.o.shape",
+   true,
+   "got (7168, 512) want (7168, 512)"
+  ],
+  [
+   "L4.o.colshard",
+   true,
+   ""
+  ],
+  [
+   "L4.o.colmatch",
+   true,
+   "o_proj cols match rank(s) [6]; q heads are rank 6"
+  ],
+  [
+   "L4.gate_up.shape",
+   true,
+   "got (3584, 7168) want (3584, 7168)"
+  ],
+  [
+   "L4.gate_up.gate",
+   true,
+   ""
+  ],
+  [
+   "L4.gate_up.up",
+   true,
+   ""
+  ],
+  [
+   "L4.gate_up.blockmatch",
+   true,
+   "g->[6] u->[6]"
+  ],
+  [
+   "L4.gate_up.ALT_tp1_contiguous_slice",
+   true,
+   "matches_wrong_layout=False"
+  ],
+  [
+   "L4.gate_up.ALT_gate_duplicated",
+   true,
+   "matched=False"
+  ],
+  [
+   "L4.down.shape",
+   true,
+   "got (7168, 1792) want (7168, 1792)"
+  ],
+  [
+   "L4.down.colshard",
+   true,
+   ""
+  ],
+  [
+   "L4.down.colmatch",
+   true,
+   "->[6]"
+  ],
+  [
+   "REPL fc.weight shape_full",
+   true,
+   "got (7168, 35840) ckpt (7168, 35840)"
+  ],
+  [
+   "REPL fc.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL hidden_norm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL hidden_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL norm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL markov_head.markov_w1.weight shape_full",
+   true,
+   "got (163840, 256) ckpt (163840, 256)"
+  ],
+  [
+   "REPL markov_head.markov_w1.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL markov_head.markov_w2.weight shape_full",
+   true,
+   "got (163840, 256) ckpt (163840, 256)"
+  ],
+  [
+   "REPL markov_head.markov_w2.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.self_attn.q_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.0.self_attn.q_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.self_attn.k_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.0.self_attn.k_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.input_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.0.input_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.post_attention_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.0.post_attention_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.self_attn.q_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.1.self_attn.q_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.self_attn.k_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.1.self_attn.k_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.input_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.1.input_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.post_attention_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.1.post_attention_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.self_attn.q_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.2.self_attn.q_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.self_attn.k_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.2.self_attn.k_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.input_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.2.input_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.post_attention_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.2.post_attention_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.self_attn.q_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.3.self_attn.q_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.self_attn.k_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.3.self_attn.k_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.input_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.3.input_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.post_attention_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.3.post_attention_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.self_attn.q_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.4.self_attn.q_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.self_attn.k_norm.weight shape_full",
+   true,
+   "got (64,) ckpt (64,)"
+  ],
+  [
+   "REPL layers.4.self_attn.k_norm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.input_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.4.input_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.post_attention_layernorm.weight shape_full",
+   true,
+   "got (7168,) ckpt (7168,)"
+  ],
+  [
+   "REPL layers.4.post_attention_layernorm.weight bitwise_vs_ckpt",
+   true,
+   ""
+  ],
+  [
+   "REPL fc.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL hidden_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL markov_head.markov_w1.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL markov_head.markov_w2.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.self_attn.q_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.self_attn.k_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.input_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.0.post_attention_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.self_attn.q_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.self_attn.k_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.input_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.1.post_attention_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.self_attn.q_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.self_attn.k_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.input_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.2.post_attention_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.self_attn.q_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.self_attn.k_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.input_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.3.post_attention_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.self_attn.q_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.self_attn.k_norm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.input_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPL layers.4.post_attention_layernorm.weight identical_across_ranks",
+   true,
+   ""
+  ],
+  [
+   "REPLICATED L0.qkv rank0",
+   true,
+   "rank 0 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank1",
+   true,
+   "rank 1 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank2",
+   true,
+   "rank 2 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank3",
+   true,
+   "rank 3 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank4",
+   true,
+   "rank 4 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank5",
+   true,
+   "rank 5 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank6",
+   true,
+   "rank 6 must equal rank 0"
+  ],
+  [
+   "REPLICATED L0.qkv rank7",
+   true,
+   "rank 7 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank0",
+   true,
+   "rank 0 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank1",
+   true,
+   "rank 1 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank2",
+   true,
+   "rank 2 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank3",
+   true,
+   "rank 3 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank4",
+   true,
+   "rank 4 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank5",
+   true,
+   "rank 5 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank6",
+   true,
+   "rank 6 must equal rank 0"
+  ],
+  [
+   "REPLICATED L1.qkv rank7",
+   true,
+   "rank 7 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank0",
+   true,
+   "rank 0 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank1",
+   true,
+   "rank 1 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank2",
+   true,
+   "rank 2 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank3",
+   true,
+   "rank 3 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank4",
+   true,
+   "rank 4 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank5",
+   true,
+   "rank 5 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank6",
+   true,
+   "rank 6 must equal rank 0"
+  ],
+  [
+   "REPLICATED L2.qkv rank7",
+   true,
+   "rank 7 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank0",
+   true,
+   "rank 0 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank1",
+   true,
+   "rank 1 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank2",
+   true,
+   "rank 2 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank3",
+   true,
+   "rank 3 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank4",
+   true,
+   "rank 4 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank5",
+   true,
+   "rank 5 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank6",
+   true,
+   "rank 6 must equal rank 0"
+  ],
+  [
+   "REPLICATED L3.qkv rank7",
+   true,
+   "rank 7 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank0",
+   true,
+   "rank 0 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank1",
+   true,
+   "rank 1 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank2",
+   true,
+   "rank 2 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank3",
+   true,
+   "rank 3 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank4",
+   true,
+   "rank 4 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank5",
+   true,
+   "rank 5 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank6",
+   true,
+   "rank 6 must equal rank 0"
+  ],
+  [
+   "REPLICATED L4.qkv rank7",
+   true,
+   "rank 7 must equal rank 0"
+  ]
+ ],
+ "fail": [
+  [
+   "L0.qkv.IS_TP1_CONTIGUOUS_SLICE",
+   "wrong layout matched"
+  ],
+  [
+   "L1.qkv.IS_TP1_CONTIGUOUS_SLICE",
+   "wrong layout matched"
+  ],
+  [
+   "L2.qkv.IS_TP1_CONTIGUOUS_SLICE",
+   "wrong layout matched"
+  ],
+  [
+   "L3.qkv.IS_TP1_CONTIGUOUS_SLICE",
+   "wrong layout matched"
+  ],
+  [
+   "L4.qkv.IS_TP1_CONTIGUOUS_SLICE",
+   "wrong layout matched"
+  ]
+ ],
+ "shapes": {
+  "fc.weight": [
+   7168,
+   35840
+  ],
+  "hidden_norm.weight": [
+   7168
+  ],
+  "layers.0.input_layernorm.weight": [
+   7168
+  ],
+  "layers.0.mlp.down_proj.weight": [
+   7168,
+   1792
+  ],
+  "layers.0.mlp.gate_up_proj.weight": [
+   3584,
+   7168
+  ],
+  "layers.0.post_attention_layernorm.weight": [
+   7168
+  ],
+  "layers.0.self_attn.k_norm.weight": [
+   64
+  ],
+  "layers.0.self_attn.o_proj.weight": [
+   7168,
+   512
+  ],
+  "layers.0.self_attn.q_norm.weight": [
+   64
+  ],
+  "layers.0.self_attn.qkv_proj.weight": [
+   6144,
+   7168
+  ],
+  "layers.1.input_layernorm.weight": [
+   7168
+  ],
+  "layers.1.mlp.down_proj.weight": [
+   7168,
+   1792
+  ],
+  "layers.1.mlp.gate_up_proj.weight": [
+   3584,
+   7168
+  ],
+  "layers.1.post_attention_layernorm.weight": [
+   7168
+  ],
+  "layers.1.self_attn.k_norm.weight": [
+   64
+  ],
+  "layers.1.self_attn.o_proj.weight": [
+   7168,
+   512
+  ],
+  "layers.1.self_attn.q_norm.weight": [
+   64
+  ],
+  "layers.1.self_attn.qkv_proj.weight": [
+   6144,
+   7168
+  ],
+  "layers.2.input_layernorm.weight": [
+   7168
+  ],
+  "layers.2.mlp.down_proj.weight": [
+   7168,
+   1792
+  ],
+  "layers.2.mlp.gate_up_proj.weight": [
+   3584,
+   7168
+  ],
+  "layers.2.post_attention_layernorm.weight": [
+   7168
+  ],
+  "layers.2.self_attn.k_norm.weight": [
+   64
+  ],
+  "layers.2.self_attn.o_proj.weight": [
+   7168,
+   512
+  ],
+  "layers.2.self_attn.q_norm.weight": [
+   64
+  ],
+  "layers.2.self_attn.qkv_proj.weight": [
+   6144,
+   7168
+  ],
+  "layers.3.input_layernorm.weight": [
+   7168
+  ],
+  "layers.3.mlp.down_proj.weight": [
+   7168,
+   1792
+  ],
+  "layers.3.mlp.gate_up_proj.weight": [
+   3584,
+   7168
+  ],
+  "layers.3.post_attention_layernorm.weight": [
+   7168
+  ],
+  "layers.3.self_attn.k_norm.weight": [
+   64
+  ],
+  "layers.3.self_attn.o_proj.weight": [
+   7168,
+   512
+  ],
+  "layers.3.self_attn.q_norm.weight": [
+   64
+  ],
+  "layers.3.self_attn.qkv_proj.weight": [
+   6144,
+   7168
+  ],
+  "layers.4.input_layernorm.weight": [
+   7168
+  ],
+  "layers.4.mlp.down_proj.weight": [
+   7168,
+   1792
+  ],
+  "layers.4.mlp.gate_up_proj.weight": [
+   3584,
+   7168
+  ],
+  "layers.4.post_attention_layernorm.weight": [
+   7168
+  ],
+  "layers.4.self_attn.k_norm.weight": [
+   64
+  ],
+  "layers.4.self_attn.o_proj.weight": [
+   7168,
+   512
+  ],
+  "layers.4.self_attn.q_norm.weight": [
+   64
+  ],
+  "layers.4.self_attn.qkv_proj.weight": [
+   6144,
+   7168
+  ],
+  "markov_head.markov_w1.weight": [
+   163840,
+   256
+  ],
+  "markov_head.markov_w2.weight": [
+   163840,
+   256
+  ],
+  "norm.weight": [
+   7168
+  ]
+ }
+}

@@ -77,10 +77,14 @@ would carry.
 from typing import ClassVar
 
 import torch
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -111,21 +115,68 @@ class KimiK3DFlashAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
-        tp_size = get_tensor_model_parallel_world_size()
-        if self.total_num_heads % tp_size != 0:
+        # DCP shards this pool by TOKEN. A GQA cache has two axes, and sharding
+        # BOTH is unreconstructible: with heads split by TP and tokens split by
+        # DCP (the same 8 GPUs), the pair (head h, token p) with
+        # owner(h) != p % W is stored by nobody, and no LSE merge recovers it --
+        # the merge sums partials over disjoint KEY sets for the SAME head.
+        # So the heads are REPLICATED across the DCP group: shard them at
+        # tp_eff = tp // dcp, leaving every rank holding its whole DCP group's
+        # head slice and the token round-robin as the only shard.
+        #
+        # `o_proj` stays at FULL tp and consumes the POST-MERGE slice: the a2a
+        # merge reduce-scatters the head axis and hands rank r heads
+        # [r*H/W, (r+1)*H/W), which is exactly that RowParallelLinear's input
+        # column shard. Hence two head counts, deliberately named apart --
+        # at DCP1 they are the same number, which is how one name survives DCP1
+        # and silently breaks DCP8.
+        tp_full = get_tensor_model_parallel_world_size()
+        self.dcp_world_size = get_dcp_world_size()
+        if tp_full % self.dcp_world_size != 0:
+            raise ValueError(
+                f"DFlash draft needs TP ({tp_full}) divisible by DCP "
+                f"({self.dcp_world_size})."
+            )
+        tp_eff = tp_full // self.dcp_world_size
+        self.tp_eff = tp_eff
+        # Cached at __init__, never per-forward: the block pass is captured as a
+        # cudagraph and a per-forward host call is a graph break / value freeze.
+        self.dcp_group = get_dcp_group() if self.dcp_world_size > 1 else None
+        if self.total_num_heads % tp_eff != 0:
             raise ValueError(
                 f"DFlash draft has {self.total_num_heads} query heads, which is "
-                f"not divisible by TP size {tp_size}."
+                f"not divisible by effective TP size {tp_eff} "
+                f"(tp={tp_full}, dcp={self.dcp_world_size})."
             )
-        self.num_heads = self.total_num_heads // tp_size
+        if self.total_num_heads % tp_full != 0:
+            raise ValueError(
+                f"DFlash draft has {self.total_num_heads} query heads, which is "
+                f"not divisible by TP size {tp_full}; `o_proj` cannot be split."
+            )
+        self.num_heads = self.total_num_heads // tp_eff
+        # What `o_proj` consumes: the post-merge width, always full-TP-sharded.
+        self.num_o_heads = self.total_num_heads // tp_full
         # The GQA-tolerant form, not a bare divisibility assert: below TP the kv
         # heads replicate rather than shard, and QKVParallelLinear already does
         # that. With 16 kv heads this only bites past TP16.
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
+        if self.total_num_kv_heads >= tp_eff:
+            assert self.total_num_kv_heads % tp_eff == 0
         else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert tp_eff % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_eff)
+
+        # Gated on dcp > 1 rather than passed unconditionally: at DCP1 the
+        # override is numerically a no-op but would flip
+        # `LinearBase.effective_tp_overridden`, and DCP1 must not move at all.
+        qkv_tp_override = (
+            {}
+            if self.dcp_world_size == 1
+            else {
+                "override_tp_size": tp_eff,
+                "override_tp_rank": get_tensor_model_parallel_rank()
+                // self.dcp_world_size,
+            }
+        )
 
         self._unit_scale = None
         self.q_size = self.num_heads * self.head_dim
@@ -140,7 +191,11 @@ class KimiK3DFlashAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            **qkv_tp_override,
         )
+        # NO override here, by design: `o_proj` is sharded by the FULL TP group
+        # and `reduce_results` all-reduces over it, which is what the
+        # post-merge head slice already lines up with.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -231,7 +286,11 @@ class KimiK3DFlashAttention(nn.Module):
             # pass doubles as memory profiling, and skipping it would leave the
             # draft's activations out of the KV budget -- but its attention has
             # nothing to attend, so the output is shaped and left at zero.
-            o = q.new_zeros((n, self.num_heads * self.head_dim))
+            # `num_o_heads`, not `num_heads`: this stands in for the attention
+            # output AFTER the DCP merge, which is what `o_proj` is shaped for.
+            # At DCP8 `num_heads` is the replicated count and would be 8x too
+            # wide here -- and this branch is on every real startup path.
+            o = q.new_zeros((n, self.num_o_heads * self.head_dim))
             return _linear_out(self.o_proj(o))
 
         self._write_block_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
@@ -276,19 +335,66 @@ class KimiK3DFlashAttention(nn.Module):
 
         bs = attn_metadata.block_tables.shape[0]
         t = q.shape[0] // bs
-        out = flash_attn_with_kvcache(
+        if self.dcp_world_size == 1:
+            out = flash_attn_with_kvcache(
+                q=q.view(bs, t, self.num_heads, self.head_dim),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                # A Tensor, and mandatory: `page_table` alone does not route to
+                # the decode kernel, and the call falls into the prefill kernel
+                # and asserts on a batch mismatch.
+                cache_seqlens=attn_metadata.context_lens[:bs],
+                softmax_scale=self.scaling,
+                causal=False,
+                page_table=attn_metadata.block_tables,
+            )
+            return out.reshape(-1, self.num_heads * self.head_dim)
+
+        # DCP: this rank read only its own token shard, so what came back is a
+        # PARTIAL softmax. `dcp_lse_merge` reconstructs the global one from the
+        # per-rank (out, lse) pairs -- valid here, and only here, because D1
+        # replicated every KV head onto every rank, so the partials being
+        # summed are over disjoint KEY sets of the SAME head.
+        #
+        # There is exactly ONE read and ONE merge: `_write_block_kv` ran first,
+        # so the block's own T rows are already in the pool and there is no
+        # separate dense-block term to merge in afterwards.
+        from atom.model_ops.dcp_ops import dcp_lse_merge
+
+        out, lse = flash_attn_with_kvcache(
             q=q.view(bs, t, self.num_heads, self.head_dim),
             k_cache=k_cache,
             v_cache=v_cache,
-            # A Tensor, and mandatory: `page_table` alone does not route to the
-            # decode kernel, and the call falls into the prefill kernel and
-            # asserts on a batch mismatch.
             cache_seqlens=attn_metadata.context_lens[:bs],
             softmax_scale=self.scaling,
             causal=False,
             page_table=attn_metadata.block_tables,
+            return_softmax_lse=True,
         )
-        return out.reshape(-1, self.num_heads * self.head_dim)
+        # The merge row is a (request, block token) pair: all T queries of a
+        # request share one local KV shard, and every rank runs the same bs and
+        # t, so the row axis is aligned across the group.
+        # out [bs, t, H, D] -> [bs*t, H, D] (free, contiguous);
+        # lse [bs, H, t]    -> [bs*t, H]    (fp32; the transpose copy is one
+        # `.contiguous()` the pack kernel would have made anyway).
+        rows = bs * t
+        merged = dcp_lse_merge(
+            out.reshape(rows, self.num_heads, self.head_dim),
+            lse.transpose(1, 2).reshape(rows, self.num_heads),
+            self.dcp_group,
+            backend="a2a",
+            # A rank can legitimately own ZERO local KV rows (ctx_lens is
+            # ceil((anchor+1+T - r)/W), which is 0 for the high ranks of a
+            # short request). The kernel is fed a floor of 1 to keep its page
+            # arithmetic valid, and `torch.zeros`-initialised LSE reads back as
+            # a FINITE 0.0 -- so `zero_nonfinite_rows` cannot catch it and the
+            # merge would weight that rank's uninitialised output by exp(0 -
+            # global_lse). These counts mask it to -inf inside the pack kernel.
+            owned_counts=getattr(attn_metadata, "dcp_owned_counts", None),
+        )
+        # Post-merge this rank owns heads [r*num_o_heads, (r+1)*num_o_heads) --
+        # exactly `o_proj`'s RowParallel input column shard.
+        return merged.reshape(rows, self.num_o_heads * self.head_dim)
 
     def _caches(self, fwd_ctx):
         """This layer's pool rows in FLASH layout, or `(None, None)` if unbound.

@@ -373,10 +373,7 @@ def test_dflash_pool_is_bf16_even_when_target_is_fp8():
             seen["kv_dtype"] = kv_dtype
             return object()
 
-    runner = types.SimpleNamespace(
-        world_size=8,
-        config=types.SimpleNamespace(kv_cache_dtype="fp8"),
-    )
+    runner = _stub_runner()
     hf = _normalized_radixark()
 
     # Patch the SELECTOR module, not draft_kv: `draft_kv_builder` imports
@@ -397,3 +394,186 @@ def test_dflash_pool_is_bf16_even_when_target_is_fp8():
     assert (
         seen["kv_dtype"] is torch.bfloat16
     ), f"draft pool must be bf16 under an fp8 target, got {seen['kv_dtype']}"
+
+
+# --------------------------------------------------------------------------
+# D1: the draft's effective TP, and the plumbing that carries it
+# --------------------------------------------------------------------------
+
+
+def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
+    """A ModelRunner stand-in carrying only what `draft_kv_builder` reads.
+
+    `world_size` IS `config.tensor_parallel_size` on the real runner
+    (model_runner.py); both are present so a regression that goes back to
+    reading `world_size` is visible as a wrong number rather than an
+    AttributeError.
+    """
+    return types.SimpleNamespace(
+        world_size=tp,
+        config=types.SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype,
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+        ),
+    )
+
+
+@pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
+def test_dflash_pool_is_built_at_effective_tp(tp, dcp):
+    """`draft_kv_builder` must size the pool at tp // dcp, not at full TP.
+
+    The DCP-invariance test above builds the pool by calling `_pool` directly,
+    so it pins the ARITHMETIC but not the PLUMBING -- it stays green with
+    `draft_kv_builder` left on the full TP world size, which is exactly the
+    double-sharded (head x token) pool that is unreconstructible at DCP8. This
+    is the test that pins the plumbing.
+    """
+    dk = pytest.importorskip(
+        "atom.spec_decode.draft_kv",
+        reason="draft_kv imports aiter at call time",
+        exc_type=(ImportError, RuntimeError),
+    )
+    pytest.importorskip(
+        "atom.model_ops.attentions.aiter_attention",
+        reason="backend probes the GPU arch at import",
+        exc_type=(ImportError, RuntimeError),
+    )
+    from unittest import mock
+
+    from atom.utils import selector
+
+    seen = {}
+
+    class _Backend:
+        DRAFT_OWNS_KV_POOL = True
+
+        @staticmethod
+        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
+            seen["world_size"] = world_size
+            return object()
+
+    hf = _normalized_radixark()
+    with (
+        mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
+        mock.patch.object(selector, "attn_family", lambda _c: None),
+    ):
+        builder = dk.draft_kv_builder(_stub_runner(tp=tp, dcp=dcp), hf)
+
+    builder._make_pool(layers=5, target_block_size=128)
+    assert seen["world_size"] == tp // dcp
+
+
+def test_qkv_parallel_linear_honours_an_effective_tp_override():
+    """The override must reach the PARAMETER, not just `LinearBase`.
+
+    `QKVParallelLinear` derives num_heads / num_kv_heads / output_sizes from
+    its own `tp_size`, so an override that only reached the base class would
+    size the parameter at full TP while the loader narrowed at the override --
+    a layer that LOOKS overridden and is not, with no error and no fault. That
+    silent no-op is the DCP8-silently-wrong path, so it gets a regression test.
+    """
+    torch = pytest.importorskip("torch")
+    lin = pytest.importorskip(
+        "atom.model_ops.linear",
+        reason="linear imports aiter at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    from unittest import mock
+
+    group = types.SimpleNamespace(world_size=8, rank_in_group=3)
+    with mock.patch.object(lin, "get_tp_group", lambda: group):
+        q = lin.QKVParallelLinear(
+            7168,
+            64,
+            64,
+            16,
+            override_tp_size=1,
+            override_tp_rank=0,
+        )
+        sharded = lin.QKVParallelLinear(7168, 64, 64, 16)
+
+    # tp_eff=1: every rank holds ALL 64 q + 16 kv + 16 v heads.
+    assert (q.num_heads, q.num_kv_heads) == (64, 16)
+    assert q.weight.shape[0] == (64 + 16 + 16) * 64 == 6144
+    # ... and the un-overridden layer still shards by the real TP group.
+    assert (sharded.num_heads, sharded.num_kv_heads) == (8, 2)
+    assert sharded.weight.shape[0] == (8 + 2 + 2) * 64
+
+    # The loader inherits the override: at tp_eff=1 the q narrow is the
+    # identity, i.e. every rank loads the FULL [4096, 7168] q weight.
+    full_q = torch.arange(4096 * 7168, dtype=torch.bfloat16).reshape(4096, 7168)
+    param = torch.nn.Parameter(
+        torch.zeros(6144, 7168, dtype=torch.bfloat16), requires_grad=False
+    )
+    param.weight_loader_process = lambda dst, src: dst.copy_(src)
+    q.weight_loader(param, full_q, "q")
+    assert torch.equal(param.data[:4096], full_q)
+
+
+@pytest.mark.parametrize(
+    "builder_name,args",
+    [
+        # (input_size, head_k_dim, head_v_dim, num_k_heads, num_v_heads)
+        ("QKVZBAParallelLinear", (7168, 128, 128, 16, 32)),
+        ("QKVZParallelLinear", (7168, 128, 128, 16, 32)),
+        # (input_size, num_k_heads, num_v_heads)
+        ("BAParallelLinear", (7168, 16, 32)),
+        # (hidden_size, head_size, total_num_heads, total_num_kv_heads)
+        ("QKVGParallelLinear", (7168, 64, 64, 16)),
+    ],
+)
+def test_sibling_qkv_layers_refuse_an_override_rather_than_swallow_it(
+    builder_name, args
+):
+    """The other fused-QKV layers derive head counts the same way.
+
+    They take `**kwargs` and do not forward it, so passing an override would be
+    the same silent no-op. None of them is on the draft's path, so they refuse
+    it loudly instead of growing an untested code path.
+    """
+    lin = pytest.importorskip(
+        "atom.model_ops.linear",
+        reason="linear imports aiter at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    cls = getattr(lin, builder_name, None)
+    if cls is None:
+        pytest.skip(f"{builder_name} not present in this tree")
+    from unittest import mock
+
+    group = types.SimpleNamespace(world_size=8, rank_in_group=0)
+    with (
+        mock.patch.object(lin, "get_tp_group", lambda: group),
+        pytest.raises(AssertionError, match="effective-TP override"),
+    ):
+        cls(*args, override_tp_size=1, override_tp_rank=0)
+
+
+def test_dcp_local_kv_count_reaches_zero_on_real_rows():
+    """A rank can legitimately own NO local KV for a real request.
+
+    `ctx_lens = ceil((anchor + 1 + T - r) / W)`. At W=8, T=5 an anchor at
+    position 0 gives 6 global tokens, so ranks 6 and 7 own nothing. The kernel
+    cannot be handed a zero-page row, and its `softmax_lse` buffer is
+    `torch.zeros` -- so an unwritten row reads back as a FINITE 0.0 that no NaN
+    scrub catches and the merge would weight by exp(0 - global_lse).
+
+    Hence the pair the proposer emits: what the KERNEL sees is floored at one
+    dummy row, and the TRUE count travels separately as `dcp_owned_counts` so
+    the merge can mask those rows to -inf.
+    """
+    W, T = 8, 5
+    anchor = 0
+    owned = [(anchor + 1 + T + (W - 1 - r)) // W for r in range(W)]
+    assert owned == [1, 1, 1, 1, 1, 1, 0, 0]
+    assert sum(owned) == anchor + 1 + T, "the round-robin must partition, not drop"
+
+    # What the kernel is handed, and what the merge is told.
+    kernel_lens = [max(1, c) for c in owned]
+    assert min(kernel_lens) == 1
+    assert [c == 0 for c in owned] == [False] * 6 + [True] * 2
+
+    # And it stops being reachable once the context is at least W tokens.
+    long_owned = [(1024 + (W - 1 - r)) // W for r in range(W)]
+    assert min(long_owned) > 0

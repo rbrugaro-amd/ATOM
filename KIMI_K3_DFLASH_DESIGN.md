@@ -763,3 +763,71 @@ requirement decides it.
    NOTE: `cache_seqlens` must be a Tensor -- a `page_table` alone does not route
    to the decode kernel and the call falls into the prefill kernel and asserts.
 4. The proposer seam: the six MLA hard-wirings in `dspark_proposer.py`.
+
+---
+
+## Appendix F — §7.3 IS NOT ACHIEVABLE ON THIS STACK. M2's gate is replaced.
+
+Measured 2026-10-06. §7.3 ("Losslessness vs greedy no-spec", 200 prompts,
+"**Any** divergence is a verify/rejection-sampler bug") and the M2 exit criterion
+built on it ("bitwise-equal token streams") assume the target reproduces itself.
+**It does not**, and this has nothing to do with the DFlash draft.
+
+### The measurement
+
+No draft loaded, prefix caching off, one server process, `temperature=0`,
+`max_tokens=1`, 10 identical requests per prompt:
+
+| prompt | distinct first tokens |
+|---|---|
+| "Explain the difference between a process and a thread." | 3 / 10 |
+| "Write a Python function that reverses a linked list..."  | 2 / 10 |
+| "Summarize the tradeoffs of speculative decoding..."      | 4 / 10 |
+| "Implement binary search over a rotated sorted array..."  | 3 / 10 |
+| "What causes a deadlock..."                               | 2 / 10 |
+| "The capital of France is"                                | **1 / 10** |
+| "2 + 2 ="                                                 | **1 / 10** |
+| "def add(a, b):\n    return"                              | **1 / 10** |
+
+The first five are `prompts_generic()` — the exact set §7.3's harness used. The
+sampler is a true argmax (`atom/model_ops/sampler.py:50`). The noise is in the
+forward; a near-tied top-1 converts it into a different token; one flip forks the
+entire suffix. **The test could only ever report FAIL.** It did: 20/20 divergent,
+including nospec-vs-nospec at 20/20.
+
+### Two independent causes, neither in the verifier
+
+1. **Run-to-run forward noise** (above). Prompt-dependent, so it is near-tie
+   amplification rather than gross corruption.
+2. **Structural, and this one is not noise at all.** The spec arm samples
+   accepted tokens from a forward at `qlen=k+1=6`; the no-spec arm from `qlen=1`.
+   Different MLA split plan — `max_split_per_batch=-1` is unpinned
+   (`atom/model_ops/attentions/aiter_mla.py:963`, `attention_mla.py:90`) so the
+   partial-softmax reduction tree differs — a structurally different KDA branch
+   (`atom/models/kimi_k3.py:1302` decode vs `:1371` spec-decode, different
+   `causal_conv1d_update` specialization), and a 6x taller lm_head GEMM. The
+   rejection sampler then demands exact id equality against that qlen=6 argmax
+   (`atom/model_ops/rejection_sampler.py:347`).
+
+   > **Spec decode is lossless w.r.t. the target's VERIFY-step argmax, not its
+   > DECODE-step argmax.** On a confident token the two coincide; on a near-tie
+   > they need not, with a perfectly correct accept loop.
+
+   `.claude/skills/dump-bisect-debug/SKILL.md:314,380` already says the stack is
+   not batch-invariant and that this is "not fixable at the ATOM layer — needs
+   aiter to ship batch-invariant kernels."
+
+### What replaces it
+
+- **§7.3 is demoted** to a cheap regression guard, rebuilt to be self-validating:
+  low-entropy prompts screened on the CONTROL arm (no draft loaded), horizon 64,
+  and every prompt run 4x *within* each arm so a prompt that flips under its own
+  arm is excluded and printed rather than scored. Excluding too much yields
+  INCONCLUSIVE, never PASS. **Result: 6/6 comparable, 0 divergent, PASS**, at
+  92.9% acceptance — so ~93% of emitted tokens went through draft+verify rather
+  than plain decode, which is what gives the reduced test its teeth.
+- **M2's exit criterion becomes GSM8K accuracy vs the no-spec baseline.** An
+  aggregate metric is immune to individual near-tie flips, and it is what CI
+  thresholds are already written against.
+- **§7.4 is unaffected.** Acceptance length remains the DCP oracle at M4; it is a
+  mean over thousands of steps, not an exact-match assertion.

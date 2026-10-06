@@ -76,10 +76,40 @@ def draft_kv_builder(model_runner, draft_hf):
         )
         kv_cache_dtype = "bf16"
 
+    # EFFECTIVE TP, not the full TP world size: under DCP the draft's KV is
+    # sharded by TOKEN across the DCP group, so its HEADS must be replicated
+    # there -- sharding both axes leaves (head, token) pairs stored by nobody
+    # and no LSE merge can recover them. The model builds its QKV at the same
+    # tp_eff; the two must be one number or the pool and the projections
+    # describe different geometries over the same bytes, with nothing to catch
+    # it (`reshape_and_cache_flash` takes head count from the key tensor and
+    # the stride from the cache, and simply stripes).
+    #
+    # Read off `model_runner.config` and NOT `get_dcp_world_size()`: this runs
+    # from the proposer's `__init__`, where the global ATOM config may not
+    # exist yet (`atom/distributed/dcp_utils.py`).
+    tp_full = model_runner.config.tensor_parallel_size
+    dcp_size = model_runner.config.decode_context_parallel_size
+    assert (
+        tp_full % dcp_size == 0
+    ), f"draft KV pool needs TP ({tp_full}) divisible by DCP ({dcp_size})"
+    if dcp_size > 1:
+        # Logged, not inferred: at DCP1 and DCP8 the draft's per-rank KV
+        # footprint is the SAME number of bytes (head replication exactly
+        # cancels token sharding), so "did the head replication actually arm"
+        # is not answerable from memory use alone. A run whose log lacks this
+        # line is a DCP run with a full-TP-sharded draft pool.
+        logger.info(
+            "Draft KV pool built at effective TP %d (tp=%d / dcp=%d): KV heads "
+            "are REPLICATED across the DCP group and sharded by token only",
+            tp_full // dcp_size,
+            tp_full,
+            dcp_size,
+        )
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
-        world_size=model_runner.world_size,
+        world_size=tp_full // dcp_size,
         kv_dtype=dtypes.d_dtypes[kv_cache_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to

@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+import os
 
 import torch
 from torch import nn
@@ -168,6 +170,19 @@ class DSparkProposer(Drafter):
         self._blk_slots = torch.zeros(max_bs * t, **i64)
         # Per-request KV length = anchor + 1 + T.
         self._blk_ctx_lens = torch.zeros(max_bs, **i32)
+        # Under DCP the length above is FLOORED AT 1 before it reaches the
+        # kernel (a zero-page row is a shape the paged read cannot run), so the
+        # TRUE local count has to travel separately for the LSE merge to tell a
+        # one-dummy-row rank from a genuinely empty one. Preallocated like
+        # `_blk_slots`/`_blk_ctx_lens` and filled in place: the block pass is
+        # cudagraph-captured and a replay reads the captured address.
+        # Allocated only under DCP so the DCP1 memory image is unchanged.
+        if self.dcp_world_size > 1:
+            self._blk_owned_req = torch.zeros(max_bs, **i32)
+            self._blk_owned_counts = torch.zeros(max_bs * t, **i32)
+        else:
+            self._blk_owned_req = None
+            self._blk_owned_counts = None
         # Every request contributes exactly T query rows, so cu_seqlens_q is a
         # constant ramp — build it once and only ever slice it.
         self._blk_cu_seqlens_q = torch.arange(0, (max_bs + 1) * t, step=t, **i32)
@@ -508,12 +523,201 @@ class DSparkProposer(Drafter):
             )
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
-        return AuxCaptureSpec(
-            layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
+            spec = own(layer_ids, self.config.hf_config.hidden_size)
+        else:
+            spec = AuxCaptureSpec(
+                layer_ids=layer_ids,
+                hidden_size=self.config.hf_config.hidden_size,
+                extract=self._extract_layer_hidden,
+            )
+        # EXPERIMENT-ONLY, both default OFF. See _arm_k3_aux_aggregate.
+        #   ATOM_K3_AUX_PROBE=1     -- measure prefix-vs-aggregate, feed prefix.
+        #   ATOM_K3_AUX_AGGREGATE=1 -- feed the AGGREGATE to the draft instead.
+        report = os.getenv("ATOM_K3_AUX_PROBE", "0") == "1"
+        feed_aggregate = os.getenv("ATOM_K3_AUX_AGGREGATE", "0") == "1"
+        if report or feed_aggregate:
+            spec = self._arm_k3_aux_aggregate(
+                target_model, spec, report=report, feed_aggregate=feed_aggregate
+            )
+        return spec
+
+    # ------------------------------------------------------------------
+    # EXPERIMENT-ONLY K3 AGGREGATE TAP -- remove before merge.
+    #
+    # Question: Kimi-K3 does not carry a plain pre-norm residual stream. It
+    # carries a BANK of per-`attn_res_block_size` snapshots plus a RUNNING
+    # PREFIX, recombined by a softmax mixture. ATOM's aux tap
+    # (`KimiDecoderLayer.aux_hidden_state`) returns the raw prefix and discards
+    # the bank; SGLang's dspark aux tap returns the mixture
+    # (`aggregate_stream`).
+    #
+    # Two independent envs, both default OFF:
+    #   ATOM_K3_AUX_PROBE=1     measures how far apart those two tensors are on
+    #                           real activations and logs it. Non-behavioural.
+    #   ATOM_K3_AUX_AGGREGATE=1 makes the wrapped extract RETURN the aggregate,
+    #                           i.e. feeds the draft SGLang's feature. This is
+    #                           the falsifier arm; it is the ONLY behavioural
+    #                           switch here.
+    # With both unset nothing below is constructed or called.
+    #
+    # NOTE: with BOTH set, the probe's cos/L2 numbers degenerate (the aux buffer
+    # it reads as "prefix" now holds the aggregate, so cos==1). Use PROBE alone
+    # to measure, AGGREGATE alone to run the A/B.
+    # ------------------------------------------------------------------
+    _k3_probe = None  # class attribute: probe state, or None when disabled
+    _k3_probe_steps = 0
+
+    def _arm_k3_aux_aggregate(
+        self,
+        target_model: nn.Module,
+        spec: AuxCaptureSpec,
+        *,
+        report: bool,
+        feed_aggregate: bool,
+    ):
+        """Wrap ``spec.extract`` so it computes the K3 aggregate stream.
+
+        Reuses ATOM's own mixture (`AttnRes` / `apply_attn_res`) rather than
+        transcribing SGLang's: the scoring weight is the NEXT layer's
+        `self_attention_attn_res.score_weight` (= `self_attention_res_norm.weight *
+        self_attention_res_proj.weight`, folded at load) and the mixture is the
+        same fused kernel the model runs, called with ``out_norm_weight=None``
+        so the result comes back un-normed -- which is exactly SGLang's
+        "softmax mixture, no output norm".
+
+        `kimi_k3.py` is `@support_torch_compile` and must not be edited, so the
+        whole probe lives here, at the hook's call site.
+        """
+        from atom.spec_decode.drafter import _resolve_decoder_layers
+
+        layers = _resolve_decoder_layers(target_model)
+        base_extract = spec.extract
+        taps: list[tuple] = []
+        probe: dict[int, dict] = {}
+        hidden = spec.hidden_size
+        for buf_idx, lid in enumerate(spec.layer_ids):
+            if lid < 0 or lid + 1 >= len(layers):
+                continue
+            res = getattr(layers[lid + 1], "self_attention_attn_res", None)
+            if res is None or not getattr(res, "enabled", False):
+                continue
+            block_size = res.block_size
+            if not block_size:
+                continue
+            # CEILING division, matching SGLang's `prev_valid_blocks`.
+            nvb = -(-(lid + 1) // block_size)
+            if nvb <= 0:
+                continue
+            # Reporting buffers only; the aggregate FED to the draft goes
+            # straight into the base hook's own aux buffer (in place, there).
+            agg = probs = None
+            if report:
+                agg = torch.zeros(
+                    self.max_num_tokens, hidden, device=self.device, dtype=self.dtype
+                )
+                probs = torch.zeros(
+                    self.max_num_tokens,
+                    nvb + 1,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            # A plain int attribute on the tapped layer, not an id()/dict lookup:
+            # the extract runs inside the target's traced region, where Dynamo
+            # constant-folds a module int attribute but graph-breaks on id().
+            # This sets a runtime attribute; it does not touch kimi_k3.py.
+            layers[lid]._k3_probe_tap = len(taps)
+            taps.append((lid, nvb, res, agg, probs))
+            probe[lid] = {"nvb": nvb, "agg": agg, "probs": probs, "buf": buf_idx}
+        if not taps:
+            logger.warning(
+                "ATOM_K3_AUX_PROBE/ATOM_K3_AUX_AGGREGATE set but no K3 "
+                "attn-residual taps found"
+            )
+            return spec
+        if report:
+            self._k3_probe = probe
+        logger.info(
+            "K3 aggregate tap armed on %s (nvb=%s, report=%s, feed_aggregate=%s)",
+            sorted(probe),
+            [probe[k]["nvb"] for k in sorted(probe)],
+            report,
+            feed_aggregate,
         )
+
+        def extract(output, block):
+            prefix = base_extract(output, block)
+            tap_idx = getattr(block, "_k3_probe_tap", -1)
+            if prefix is None or tap_idx < 0:
+                return prefix
+            _lid, nvb, res, agg_buf, probs_buf = taps[tap_idx]
+            bank = output[-1]
+            if bank is None or bank.shape[1] < nvb:
+                return prefix
+            bank = bank[:, :nvb, :]
+            score_weight = res.score_weight
+            if score_weight is None:  # loader hook did not run (plugin hosts)
+                res.process_weights_after_loading()
+                score_weight = res.score_weight
+            from atom.model_ops.kimi_k3 import apply_attn_res
+
+            mixed, _ = apply_attn_res(
+                prefix, bank, score_weight, res.eps, None, None, res.out_eps
+            )
+            if report:
+                # The softmax mass itself -- the interpretable number. Recomputed
+                # in plain torch because the fused kernel keeps `probs` in
+                # registers.
+                rows = torch.cat([bank, prefix.unsqueeze(1)], dim=1).float()
+                normed = rows * torch.rsqrt(
+                    rows.pow(2).mean(-1, keepdim=True) + res.eps
+                )
+                probs = torch.softmax((normed * score_weight).sum(-1), dim=-1)
+                off = get_forward_context().context.ubatch_token_offset
+                n = prefix.shape[0]
+                agg_buf[off : off + n].copy_(mixed)
+                probs_buf[off : off + n].copy_(probs)
+            # The ONLY behavioural switch. `mixed` is handed to the base aux
+            # hook, which copies it in place into the fixed capture buffer it
+            # would otherwise have filled with `prefix` -- same buffer, same
+            # shape, so cudagraph capture is unaffected.
+            return mixed if feed_aggregate else prefix
+
+        return dataclasses.replace(spec, extract=extract)
+
+    def _k3_probe_report(self, num_tokens: int) -> None:
+        """Log prefix-vs-aggregate divergence for the rows of the last target
+        forward. Host-syncing, so it runs outside any compiled region."""
+        type(self)._k3_probe_steps += 1
+        step = type(self)._k3_probe_steps
+        if step > 3:
+            return
+        for lid, info in sorted(self._k3_probe.items()):
+            prefix = self._aux_buffers[info["buf"]][:num_tokens].double()
+            agg = info["agg"][:num_tokens].double()
+            probs = info["probs"][:num_tokens].double()
+            keep = prefix.pow(2).sum(-1) > 0
+            if not bool(keep.any()):
+                continue
+            prefix, agg, probs = prefix[keep], agg[keep], probs[keep]
+            cos = torch.nn.functional.cosine_similarity(prefix, agg, dim=-1)
+            rel = (agg - prefix).norm(dim=-1) / prefix.norm(dim=-1).clamp_min(1e-12)
+            prefix_mass = probs[:, -1]
+            logger.info(
+                "K3_AUX_PROBE step=%d tap=%d nvb=%d rows=%d "
+                "cos_mean=%.6f cos_min=%.6f relL2_mean=%.4f relL2_max=%.4f "
+                "prefix_mass_mean=%.4f prefix_mass_min=%.4f bank_mass_mean=%.4f",
+                step,
+                lid,
+                info["nvb"],
+                int(keep.sum()),
+                cos.mean().item(),
+                cos.min().item(),
+                rel.mean().item(),
+                rel.max().item(),
+                prefix_mass.mean().item(),
+                prefix_mass.min().item(),
+                1.0 - prefix_mass.mean().item(),
+            )
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):
@@ -645,6 +849,8 @@ class DSparkProposer(Drafter):
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
             )
+        if self._k3_probe is not None:  # MEASUREMENT-ONLY (ATOM_K3_AUX_PROBE=1)
+            self._k3_probe_report(target_hidden_states.shape[0])
         # aux is validated here (drafting requires it) but the target context is
         # already in the draft's KV: `compute_draft_kv` absorbed it right
         # after the target forward, uniformly for every flavor. propose() only
@@ -866,12 +1072,27 @@ class DSparkProposer(Drafter):
                 )
             )
             # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
-            ctx_lens.copy_(
+            owned = self._blk_owned_req[:running_bs]
+            owned.copy_(
                 torch.div(
                     global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
                     self.dcp_world_size,
                     rounding_mode="floor",
                 )
+            )
+            # That count is genuinely ZERO on real rows: L = anchor + 1 + T, so
+            # at W=8/T=5 an anchor at position 0 leaves ranks 6 and 7 owning
+            # nothing. The kernel cannot be handed a zero-page row, and its
+            # softmax_lse buffer is `torch.zeros`, so an unwritten row reads
+            # back as a FINITE 0.0 that the merge would happily weight by
+            # exp(0 - global_lse). Floor what the KERNEL sees at one dummy row
+            # (its page arithmetic stays valid) and carry the TRUE count to the
+            # merge, which masks those rows to -inf inside its pack kernel.
+            ctx_lens.copy_(owned.clamp(min=1))
+            # One merge row per (request, block token): the same per-request
+            # count broadcast over the T query rows.
+            self._blk_owned_counts[: running_bs * T].view(running_bs, T).copy_(
+                owned.view(-1, 1).expand(running_bs, T)
             )
         else:
             # slot = page_id * block_size + offset_in_page, derived on-device
@@ -903,8 +1124,19 @@ class DSparkProposer(Drafter):
             # all ones already, which is what one page holding one token means.
             slots[scheduled_bs:].fill_(-1)
             ctx_lens[scheduled_bs:].fill_(self._paged_pad_ctx_len)
+            if self._blk_owned_counts is not None:
+                # Non-zero for the same reason the context is: a row every rank
+                # reports as empty merges to -inf on every shard, i.e. NaN. The
+                # tail is aimed nowhere, but it still has to be a runnable row.
+                self._blk_owned_counts[scheduled_bs * T : running_bs * T].fill_(
+                    self._paged_pad_ctx_len
+                )
 
         attn_metadata.slot_mapping = slots.view(-1)
+        if self._blk_owned_counts is not None:
+            # The merge's per-row mask; see `_attend_non_causal`. Left UNSET on
+            # the DCP1 path, which never merges.
+            attn_metadata.dcp_owned_counts = self._blk_owned_counts[: running_bs * T]
         attn_metadata.block_tables = block_tables
         attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
         attn_metadata.context_lens = ctx_lens

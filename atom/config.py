@@ -2267,6 +2267,34 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
+                # A non-MLA draft owns a SIBLING KV pool with two axes, and DCP
+                # shards one of them. That is only reconstructible where the
+                # draft replicates its heads across the DCP group and merges
+                # the per-rank partial softmaxes by LSE -- which exactly one
+                # draft family in this tree does (the DFlash non-causal GQA
+                # block drafter, `needs_non_causal_kv`). MLA is immune by
+                # construction: its cache is one latent row per token,
+                # replicated across TP, so DCP's token shard is the only shard.
+                #
+                # Every OTHER non-MLA draft (Eagle3-llama, a plain GQA
+                # speculator) double-shards and produces garbage with NO error
+                # and NO fault -- the only symptom is lost acceptance length.
+                # Refuse it rather than ship that.
+                from atom.spec_decode.draft_kv import needs_non_causal_kv
+                from atom.utils.selector import Family, attn_family
+
+                draft_hf = self.speculative_config.draft_model_hf_config
+                if draft_hf is not None and attn_family(draft_hf) is not Family.MLA:
+                    assert needs_non_causal_kv(draft_hf), (
+                        "Decode context parallel (--decode-context-parallel-size "
+                        f"{self.decode_context_parallel_size}) with a non-MLA "
+                        "draft is only supported for the DFlash block drafter, "
+                        "which replicates its KV heads across the DCP group and "
+                        "merges the per-rank partial softmaxes. This draft "
+                        f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
+                        "would be sharded on BOTH the head and the token axis, "
+                        "which is unreconstructible. Disable DCP for this draft."
+                    )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups

@@ -22,17 +22,42 @@ def load(d, workload):
 
 
 def cmp_lossless(a, b):
-    """Spec decode must be output-identical to greedy non-speculative decoding.
+    """Spec decode must be output-identical to greedy non-speculative decoding
+    ON PROMPTS WHERE EACH ARM AGREES WITH ITSELF.
 
-    Any divergence is a verifier / rejection-sampler bug, not draft quality, and
-    it invalidates every acceptance number measured after it.
+    That qualifier is load-bearing and was missing originally. Kimi-K3 on this
+    stack is not reproducible run to run: with no draft at all, in one process,
+    an open-ended prompt returns several different first tokens across identical
+    ``temperature=0`` requests (the sampler is a true argmax -- the noise is in
+    the forward, and a near-tied top-1 turns it into a different token). A
+    prompt that flips under the baseline cannot say anything about the draft,
+    so comparing it to the other arm manufactures a FAIL out of GPU noise.
+
+    Each arm therefore runs every prompt ``LOSSLESS_REPS`` times and records
+    ``self_consistent``. Only prompts stable in BOTH arms are evidence; the rest
+    are reported and excluded. If too few survive, the verdict is INCONCLUSIVE
+    rather than PASS -- "nothing left to compare" is not a pass.
     """
     ra, rb = a["rows"], b["rows"]
     if len(ra) != len(rb):
         print(f"FAIL: prompt count differs: {len(ra)} vs {len(rb)}")
         return False
+
+    # Older banked runs predate self_consistent; absent means "never checked",
+    # which is exactly the state that produced the bogus verdict. Treat it as
+    # unproven rather than defaulting it to True.
+    def stable(r):
+        return bool(r.get("self_consistent", False))
+
+    excluded = [
+        (x["i"], stable(x), stable(y))
+        for x, y in zip(ra, rb, strict=True)
+        if not (stable(x) and stable(y))
+    ]
+    pairs = [(x, y) for x, y in zip(ra, rb, strict=True) if stable(x) and stable(y)]
+
     bad = []
-    for x, y in zip(ra, rb, strict=True):
+    for x, y in pairs:
         ta, tb = x.get("text", ""), y.get("text", "")
         na = (x.get("usage") or {}).get("completion_tokens")
         nb = (y.get("usage") or {}).get("completion_tokens")
@@ -53,14 +78,37 @@ def cmp_lossless(a, b):
                 )
             )
     print(f"\n== LOSSLESS  {a['arm']} vs {b['arm']} ==")
-    print(f"  prompts: {len(ra)}   divergent: {len(bad)}")
+    print(f"  prompts: {len(ra)}   comparable: {len(pairs)}   divergent: {len(bad)}")
+    for i, sa, sb in excluded:
+        why = []
+        if not sa:
+            why.append(f"{a['arm']} flipped")
+        if not sb:
+            why.append(f"{b['arm']} flipped")
+        print(f"  EXCLUDED prompt {i}: not self-consistent ({', '.join(why)})")
     for i, k, na, nb, sa, sb in bad[:5]:
         print(f"  prompt {i}: first diff at char {k}, tokens {na} vs {nb}")
         print(f"     A: ...{sa!r}")
         print(f"     B: ...{sb!r}")
+
+    # Require a real majority of the set to have been comparable. Excluding
+    # everything and declaring PASS is the failure mode this guard exists for.
+    min_comparable = max(1, (len(ra) + 1) // 2)
+    if len(pairs) < min_comparable:
+        print(
+            f"  VERDICT: INCONCLUSIVE - only {len(pairs)}/{len(ra)} prompts were "
+            f"self-consistent in both arms (need {min_comparable}). The baseline "
+            "is too noisy on this hardware to license a losslessness claim."
+        )
+        return False
     ok = not bad
     print(
-        "  VERDICT:", "PASS - token streams identical" if ok else "FAIL - NOT LOSSLESS"
+        "  VERDICT:",
+        (
+            f"PASS - token streams identical on all {len(pairs)} comparable prompts"
+            if ok
+            else "FAIL - NOT LOSSLESS"
+        ),
     )
     return ok
 
@@ -117,9 +165,15 @@ def cmp_swebench(a, b):
         if x.get("text") == y.get("text")
     )
     print(f"  identical outputs across arms: {agree}/{len(a['rows'])}")
-    print(
-        "  (both arms are lossless w.r.t. the same target, so greedy outputs SHOULD match)"
-    )
+    # This line used to claim "both arms are lossless w.r.t. the same target, so
+    # greedy outputs SHOULD match". That is FALSE on this stack and would have
+    # manufactured the same bogus failure the lossless check did: SWE-bench
+    # prompts are open-ended, the target does not reproduce itself run to run on
+    # open-ended prompts (see cmp_lossless), and 512-token continuations cross
+    # many near-ties. Expect this count to be LOW, and read nothing into it.
+    # Losslessness is established by `lossless`, on prompts chosen so the
+    # baseline is stable; here the number of interest is accept_length.
+    print("  (informational only -- see cmp_lossless; agreement here is NOT expected)")
     print("  VERDICT:", "PASS" if ok else "FAIL - empty generations")
     return ok
 

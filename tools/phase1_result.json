@@ -1,0 +1,9 @@
+{
+  "refused": [
+    "confidence_head.proj.bias",
+    "confidence_head.proj.weight"
+  ],
+  "dropped": [],
+  "unloaded": [],
+  "failures": []
+}
