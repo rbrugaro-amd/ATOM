@@ -387,6 +387,41 @@ class DSparkProposer(Drafter):
         # width; default to the full block (a static verify length == block).
         return num_spec or self.dspark_block_size
 
+    @property
+    def _draft_reads_non_causal_gqa(self) -> bool:
+        """Whether the draft block reads through mha_v3 rather than aiter MLA.
+
+        The flavor is the draft CONFIG's, resolved the same way
+        `draft_kv_builder` resolves it, so the proposer and the pool cannot
+        disagree about which kernel the block is planned for. A GQA draft plans
+        nothing: mha_v3 takes the page table and `cache_seqlens` and derives its
+        own tiling, so the whole persistent MLA work plan is skipped.
+        """
+        spec = getattr(self, "speculative_config", None)
+        if spec is None or not self._with_draft:
+            # Inline V4 DSpark, or a double that never set one up: neither owns
+            # a pool of its own, so neither takes the non-causal GQA path.
+            return False
+        from atom.spec_decode.draft_kv import needs_non_causal_kv
+
+        return needs_non_causal_kv(spec.draft_model_hf_config)
+
+    def _draft_layer_num(self) -> int:
+        """The draft's first layer number, whichever attention it carries.
+
+        Both flavors register an `Attention` and expose `layer_num` on it; only
+        the attribute holding it differs (`mla_attn` vs `attn`).
+        """
+        attn = self.model.layers[0].self_attn
+        holder = getattr(attn, "mla_attn", None) or getattr(attn, "attn", None)
+        if holder is None:
+            raise AttributeError(
+                "draft layer 0 exposes neither `mla_attn` nor `attn`; the "
+                "proposer reads `layer_num` off one of them to find the "
+                "draft's rows in the KV cache data"
+            )
+        return holder.layer_num
+
     def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
         """The draft's own paged K cache, or None while the pool is unallocated.
 
@@ -397,7 +432,7 @@ class DSparkProposer(Drafter):
         fully bound. Gating on the flag would let the second one through
         describing whatever the previous real step left behind.
         """
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+        layer_num = self._draft_layer_num()
         cache_data = forward_context.kv_cache_data or {}
         entry = cache_data.get(f"layer_{layer_num}")
         bound = getattr(entry, "k_cache", None) if entry is not None else None
@@ -431,7 +466,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
-            layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+            layer_num = self._draft_layer_num()
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -774,12 +809,18 @@ class DSparkProposer(Drafter):
         # rope-concat-and-cache write, whose kernel derives the KV dtype from
         # the tensor it was given and rejects a mismatched pair. Left unset, the
         # pass inherits whatever the TARGET's metadata was carrying.
-        dtype_q = self._blk_dtype_q
-        if dtype_q is None:
-            dtype_q, final = self._resolve_dtype_q(forward_context)
-            if final:
-                self._blk_dtype_q = dtype_q
-        attn_metadata.dtype_q = dtype_q
+        # MLA only. `dtype_q` is read by attention_mla's decode to allocate
+        # q_out and match the fused rope-concat-and-cache write; the MHA path
+        # never reads it, and `_resolve_dtype_q` reaches through
+        # `layers[0].self_attn.mla_attn`, which a GQA draft does not have.
+        dtype_q = None
+        if not self._draft_reads_non_causal_gqa:
+            dtype_q = self._blk_dtype_q
+            if dtype_q is None:
+                dtype_q, final = self._resolve_dtype_q(forward_context)
+                if final:
+                    self._blk_dtype_q = dtype_q
+            attn_metadata.dtype_q = dtype_q
 
         if self._bound_draft_k_cache(forward_context) is None:
             # warmup_model() runs before allocate_kv_cache(), so there is no
@@ -915,6 +956,14 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+
+        if self._draft_reads_non_causal_gqa:
+            # A GQA draft reads through mha_v3, which plans nothing: it takes
+            # the page table and `cache_seqlens` directly and derives its own
+            # tiling. Everything below this point is the aiter MLA persistent
+            # work plan -- head padding, split budget, work descriptors -- and
+            # none of it has an MHA counterpart to fill in.
+            return
 
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1

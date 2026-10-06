@@ -1200,13 +1200,27 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
       their DSpark fields at the config top level: ``target_layer_ids``,
       ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    - STANDALONE, SpecForge-trained (DFlash) drafts are also their own
+      checkpoint, but nest the same two fields under ``dflash_config`` and put
+      the trained block width at the top level as ``block_size``. SpecForge
+      builds these on a plain ``Qwen3Config``, so the backbone is GQA rather
+      than MLA -- which this function does not care about, but the log line
+      below does.
+
+    Both standalone shapes are read here; ``dflash_config`` is the fallback so
+    a checkpoint carrying both stays on its top-level values.
     """
-    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+
+    target_layer_ids = getattr(
+        hf_config, "target_layer_ids", None
+    ) or dflash_config.get("target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
-            "K3DSparkModel config is missing `target_layer_ids` (the target "
-            "decoder layers whose hidden states the draft consumes). Without "
-            "it the draft has no context input."
+            "Standalone DSpark draft config is missing `target_layer_ids` (the "
+            "target decoder layers whose hidden states the draft consumes), at "
+            "the top level and under `dflash_config`. Without it the draft has "
+            "no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
@@ -1215,9 +1229,12 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     mask_token_id = getattr(hf_config, "mask_token_id", None)
     if mask_token_id is None:
+        mask_token_id = dflash_config.get("mask_token_id")
+    if mask_token_id is None:
         raise ValueError(
-            "K3DSparkModel config is missing `mask_token_id` (the noise token "
-            "the draft block is seeded with)."
+            "Standalone DSpark draft config is missing `mask_token_id` (the "
+            "noise token the draft block is seeded with), at the top level and "
+            "under `dflash_config`."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
@@ -1226,17 +1243,27 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
 
-    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
-    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
-    # width-agnostic in its weights and the block is sized by
-    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
-    # DSparkProposer._resolve_mtp_k falls back to that.
+    # The trained block width, where the checkpoint records one. K3-DSpark does
+    # not: its draft is width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in that checkpoint's own serving recipe), so
+    # `dspark_block_size` stays unset and DSparkProposer._resolve_mtp_k falls
+    # back to the flag. SpecForge DFlash checkpoints DO record it, as a
+    # top-level `block_size`. Recording it does not pin the verify horizon --
+    # `_resolve_mtp_k` still returns --num-speculative-tokens -- it only lets
+    # Config.__post_init__ warn when the horizon runs past the trained width.
+    block_size = getattr(hf_config, "block_size", None)
+    if block_size:
+        hf_config.dspark_block_size = int(block_size)
 
+    # The backbone is the draft's own business, but say which one so a
+    # mis-detected flavor is visible in the log rather than only in acceptance.
+    backbone = "MLA" if getattr(hf_config, "kv_lora_rank", None) else "GQA"
     logger.info(
-        "Detected MLA DSpark drafter with a separate draft model "
+        f"Detected {backbone} DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
-        f"mask_token_id={hf_config.dspark_noise_token_id})"
+        f"mask_token_id={hf_config.dspark_noise_token_id}, "
+        f"block_size={getattr(hf_config, 'dspark_block_size', None)})"
     )
 
 
@@ -1457,6 +1484,20 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        # SpecForge DFlash drafts, before the suffix test below: they are
+        # standalone DSpark checkpoints too, but their arch is `DSparkDraftModel`
+        # -- which ends in "DraftModel", not "DSparkModel", so the suffix test
+        # misses them -- and SpecForge stamps that same string on every DFlash
+        # draft regardless of target. So key on the nested `dflash_config` the
+        # backbone actually needs, and rename to an arch that identifies the
+        # model. The rename also resolves a collision: `DSparkDraftModel` is
+        # already the name of ATOM's draft base class in
+        # atom/models/dspark_draft.py, and `support_draft_model_arch_dict` is a
+        # bare dict index keyed on this string.
+        if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
+            hf_config.architectures = ["K3DFlashModel"]
+            _normalize_draft_dspark_config(hf_config)
+            return
         if arch.endswith("DSparkModel"):
             _normalize_draft_dspark_config(hf_config)
             return

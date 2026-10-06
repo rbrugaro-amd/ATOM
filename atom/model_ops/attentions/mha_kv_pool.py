@@ -264,6 +264,33 @@ class MhaKvPool:
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
         )
 
+    def fa_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's `(k, v)`, aliasing the pool, in FLASH layout.
+
+        `[blocks, block_size, kv_heads, head_dim]` -- the axis order aiter's
+        `mha_v3.flash_attn_with_kvcache` requires. It reads every axis through
+        its own stride, so a non-contiguous view would be fine, but it hard
+        unpacks FOUR axes: SHUFFLE cannot be offered to it at all, because the
+        x-pack splits `head_dim` across two non-adjacent axes and no permute of
+        a 5-D tensor can put it back.
+
+        Same bytes as `kv_views`, re-shaped rather than converted -- the pool
+        charges per byte (`mha_kv_fields`), so the element order costs nothing
+        and only the reader's requirements decide it.
+
+        This is the layout a NON-CAUSAL reader needs, which is why it exists:
+        every aiter kernel that reads SHUFFLE is causal at `qlen > 1`
+        (`unified_attention` structurally, `pa_decode_gluon` by deriving
+        `is_causal = query_length > 1`, and the persistent ASM path has no
+        `Msk=0` kernel built on gfx950). A block-diffusion draft attends its
+        block bidirectionally, so it reads here instead.
+        """
+        nh, hd, bs = self.num_kv_heads, self.head_dim, self.block_size
+        return (
+            self.field_view("k", layer, self.kv_dtype, (-1, bs, nh, hd)),
+            self.field_view("v", layer, self.kv_dtype, (-1, bs, nh, hd)),
+        )
+
     def scale_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k_scale, v_scale)`, one fp32 per (kv head, token).
 
