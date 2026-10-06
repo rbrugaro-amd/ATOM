@@ -193,6 +193,127 @@ The summary now carries `per_request_source`, `n_joined` and
 `acc_len_global_server_delta` disagrees with `acc_len_global`, the attribution
 is incomplete and the card-style number must not be quoted.
 
+## M4 / DCP8: **WORKING AND MEASURED** 2026-10-06. First iteration, no debug loop.
+
+The DFlash GQA draft now serves at TP8/DCP8. Decision 4 of the four below is
+answered: the go/no-go is GO, and it is landed.
+
+| | DCP1 | DCP8 | delta |
+|---|---|---|---|
+| acceptance rate | 63.66% | **64.40%** | +0.74 pp |
+| avg toks/fwd | 4.18 | **4.22** | **+0.04** (oracle: within 0.2) |
+| gsm8k flexible | 0.980 / 0.990 | 0.980 | within noise |
+| gsm8k strict | 0.980 / 0.990 | 0.975 | within noise |
+| `num_kvcache_blocks` | 19475 | 6899 | 2.82x fewer, 2.8x MORE global tokens |
+| peak VRAM / rank | 198.37 GB | 200.47 GB | +2.10 GB |
+
+GSM8K 5-shot, n=200, K=5, `ATOM_K3_AUX_AGGREGATE=1`, 45000 draft tokens each
+arm. Both runs verified armed from the server log before being trusted
+(`K3 aggregate tap armed ... feed_aggregate=True`, and
+`'decode_context_parallel_size': 8` in the Engine kwargs line).
+
+**The DCP1 arm is the regression check and it did not move.** 63.66% / 4.18 at
+n=200 against the banked 62.04% / 4.10 at n=1319 -- same ballpark, and the
+difference is n, not code. Every DCP path is gated on `dcp_world_size > 1` and
+the QKV override is not even PASSED at dcp == 1, so DCP1 is byte-identical by
+construction rather than by measurement.
+
+### How to reproduce
+
+    DCP=8 ATOM_K3_AUX_AGGREGATE=1 K=5 LIMIT=200 \
+      RUNDIR=/tmp/dflash_ab/dcp8/radixark ./tools/dflash_ab.sh radixark gsm8k
+
+`DCP=` is a new knob in `tools/dflash_ab.sh`. **DCP=1 emits NO flag at all**, so
+the DCP1 command line is unchanged.
+
+### The shape, in one paragraph (design S2.2, unchanged)
+
+QKV is built at `tp_eff = tp // dcp`, the sibling KV pool is sized the same
+way, so at TP8/DCP8 EVERY rank holds all 64 q and all 16 kv heads and the token
+round-robin is the only shard. `o_proj` stays at FULL TP and consumes the
+POST-MERGE slice: `dcp_lse_merge(backend='a2a')` reduce-scatters the head axis
+and leaves rank r owning heads [8r, 8r+8), which is exactly that
+`RowParallelLinear`'s input column shard. One paged read, one merge -- the
+block's own T rows are in the pool before the read, so Appendix C's refutation
+of the two-term merge holds and there is no dense-block term.
+
+### THE BLOCKER that would have made D1 a silent no-op
+
+`QKVParallelLinear` took `**kwargs` and forwarded NEITHER `override_tp_size`
+nor `override_tp_rank` to `LinearBase`, while deriving its own
+`num_heads`/`num_kv_heads`/`output_sizes` from `get_tp_group().world_size`.
+Passing an override raised nothing, logged nothing, and produced exactly the
+unreconstructible double-shard of S2.1. `ColumnParallelLinear` and
+`MergedColumnParallelLinear` already forwarded them; QKV was the odd one out.
+Fixed in `atom/model_ops/linear.py` with a regression test. The four sibling
+fused-QKV layers (`QKVZ`, `QKVZBA`, `QKVG`, `BA`) now **refuse** an override
+rather than swallow it -- they are not on this path and should not grow an
+untested one.
+
+### THE SILENT HAZARD, and what was done about it
+
+A rank can legitimately own ZERO local KV rows:
+`ctx_lens = ceil((anchor + 1 + T - r) / W)`, so at W=8/T=5 an anchor at
+position 0 leaves ranks 6 and 7 owning nothing. mha_v3 allocates `softmax_lse`
+with `torch.zeros`, so an unwritten row reads back as a **FINITE 0.0** --
+`zero_nonfinite_rows` cannot catch it, and the merge would weight that rank's
+uninitialised output by `exp(0 - global_lse)`. What the KERNEL sees is now
+floored at one dummy row (its page arithmetic stays valid) and the TRUE count
+travels separately as `attn_metadata.dcp_owned_counts`, which the existing a2a
+pack kernel masks to -inf at zero extra launches.
+
+### mha_v3's LSE CONVENTION: **CLOSED**, and it was the last open assumption
+
+Appendix D measured that the kernel RETURNS an lse and that its OUTPUT is
+accurate. It never checked the lse's numerical convention -- natural log vs
+log2, whether `softmax_scale` is folded in, whether the max-subtraction is
+undone. The entire merge rested on it. `tools/m0_lse_merge.py` closes it on ONE
+GPU with NO server: split a paged KV into W disjoint round-robin token shards,
+read each with mha_v3, merge with ATOM's own `correct_attn_out`, compare
+against one full-KV read. **16/16 PASS**, rel err 0.0026-0.0049, across
+head_dim 64/128 x kv heads 2/16 x T 5/7 x W 2/8. Run it before any future
+aiter bump; a transposed or rebased lse would otherwise produce plausible but
+wrong acceptance with no error.
+
+### What is verified by an actual DCP8 GPU RUN vs by code reading
+
+**By the DCP8 run:** the server starts; the draft's QKV loads the FULL
+[6144, 7168] on every rank with no shape error; the warmup/memory-profiling
+pass survives (that is the `num_o_heads` fix -- it runs before
+`allocate_kv_cache`, so `k_cache is None` and the branch is taken on every real
+start); **the cudagraph capture accepts an `all_to_all_single` inside the draft
+block pass** (this was the one flagged bring-up risk, and it is now a measured
+non-issue); the merge is numerically right end-to-end; and
+`num_kvcache_blocks` 19475 -> 6899 is direct runtime proof the pool's
+`entry_bytes` grew 8x, i.e. D1 armed.
+
+**By code reading + CPU test only, NOT by the DCP8 run:**
+- **the `owned_counts` zero-row mask never fired on a real row.** GSM8K anchors
+  sit deep in a long context, so `ctx_lens` is never 0 there; only the pad tail
+  exercised the floor. The hazard is real (the arithmetic is pinned by a unit
+  test) but the masking path is unproven on GPU. **A short-prompt workload is
+  the missing test.**
+- TP8/**DCP2** (tp_eff = 4, the only setting where `num_kv_head_replicas`
+  reasoning and the partial override both bite) was never run.
+- the `atom/config.py` guard's REFUSAL branch (non-MLA, non-DFlash draft under
+  DCP) was never triggered on GPU.
+- **per-rank acceptance was NOT obtainable.** ATOM aggregates into one global
+  distribution; S7.4 asks for per-rank, which would localise an ownership bug
+  immediately. Still worth wiring.
+
+### Still open after M4
+
+- Perf at DCP8 is UNMEASURED. The merge adds one `all_to_all_single` per draft
+  layer per block pass (5 per step). `gsm8k` reports accuracy and acceptance,
+  not tok/s. Run `perf` / `swebench` at DCP=8 before quoting any throughput.
+- The +2.10 GB/rank is the QKV weight replication. **S2.4's DCP-invariance
+  claim is about the KV POOL only** -- head replication cancels token sharding
+  there exactly, but WEIGHTS do not cancel, and the design does not say so.
+  Budget it explicitly.
+- `tools/phase1_tp8.py` was NOT parameterized on DCP. The loader at tp_eff=1 is
+  proven by the run starting and by the unit test, not by the bitwise
+  safetensors oracle that proved DCP1.
+
 ## NEEDS HUMAN — loop STOPPED 2026-10-06 (cron job 33714f3d deleted)
 
 **Everything unblocked is done.** The branch works and delivers uplift. Every
