@@ -48,8 +48,19 @@ backup (`tests/test_per_request_spec_stats.py`,
 
 ### Files touched and how to undo
 
-Pristine copies of every file below: `tools/revert_backup/<path with `/` ->
-`_`>.orig`.
+> **This section is HISTORICAL. The revert already happened and this branch
+> carries none of it** — every file below is at upstream content here.
+> `tools/revert_backup/` is deliberately absent from this share branch: four of
+> its `.orig` files were byte-identical to the live `atom/model_engine/*.py`
+> they backed up (verified by blob hash, not by eye), so they were pure dead
+> weight, and shipping verbatim engine-source copies under `tools/` on a branch
+> another team applies in CI invites someone to mistake them for live code.
+> They remain on the dev branch: `git show
+> rbrugaro/k3-dflash-draft:tools/revert_backup/<name>`. The undo recipe below is
+> kept only as a record of what was reverted; do not run it here.
+
+Pristine copies of every file below (DEV BRANCH ONLY):
+`tools/revert_backup/<path with `/` -> `_`>.orig`.
 
 | file | what was added |
 |---|---|
@@ -212,6 +223,25 @@ arm. Both runs verified armed from the server log before being trusted
 (`K3 aggregate tap armed ... feed_aggregate=True`, and
 `'decode_context_parallel_size': 8` in the Engine kwargs line).
 
+### Confirmed at the FULL 1319 sample, 2026-10-06 (this is the number to quote)
+
+The n=200 pair above compares DCP8 to a *different* DCP1 run than the one every
+other figure in this file is stated against. Re-run at n=1319 against the
+canonical DCP1 result:
+
+| GSM8K 5-shot, n=1319, K=5 | DCP1 (canonical) | **DCP8** | delta |
+|---|---|---|---|
+| acceptance rate | 62.04% | **61.84%** | -0.20 pp |
+| avg toks/fwd | 4.10 | **4.09** | **-0.01** (oracle: within 0.2) |
+| gsm8k flexible | 0.9500 | **0.9515** +- 0.0059 | +0.15 pp, well inside 1 sigma |
+| gsm8k strict | -- | 0.9507 +- 0.0060 | |
+
+**S7.4's oracle passes with 20x margin** (0.01 against a 0.2 budget), and this
+is the tighter measurement: n=1319 narrows the accuracy band from +-0.0099 to
++-0.0059. This run also doubles as the regression check on `8a588af01`, which
+touched `linear.py` -- shared code that 12 model files import.
+`RUNDIR=/tmp/dflash_ab/dcp8_full/radixark`.
+
 **The DCP1 arm is the regression check and it did not move.** 63.66% / 4.18 at
 n=200 against the banked 62.04% / 4.10 at n=1319 -- same ballpark, and the
 difference is n, not code. Every DCP path is gated on `dcp_world_size > 1` and
@@ -297,22 +327,81 @@ non-issue); the merge is numerically right end-to-end; and
   reasoning and the partial override both bite) was never run.
 - the `atom/config.py` guard's REFUSAL branch (non-MLA, non-DFlash draft under
   DCP) was never triggered on GPU.
-- **per-rank acceptance was NOT obtainable.** ATOM aggregates into one global
-  distribution; S7.4 asks for per-rank, which would localise an ownership bug
-  immediately. Still worth wiring.
+- **per-rank acceptance was NOT obtainable, and the reason is structural.**
+  Acceptance is a SCHEDULER-level quantity computed after the verify, so ATOM
+  has exactly one global counter by construction, not eight. A per-rank
+  ownership bug therefore does not appear as a divergence between eight
+  numbers; it appears as the one number falling. It did not fall. S7.4's
+  "log it per rank" would need the counter moved below the verify, which is a
+  bigger change than it sounds.
+
+### Files touched for M4
+
+| file | change |
+|---|---|
+| `atom/model_ops/linear.py` | `QKVParallelLinear` honours + forwards the effective-TP override; `QKVZ`/`QKVZBA`/`QKVG`/`BA` refuse it loudly |
+| `atom/models/kimi_k3_dflash.py` | `tp_eff = tp // dcp` head sharding; `num_o_heads` split out from `num_heads`; `dcp_group`/`dcp_world_size` cached at `__init__` (never per-forward -- the block pass is captured); warmup zero at the POST-MERGE width; `_attend_non_causal` grows a `return_softmax_lse=True` + `dcp_lse_merge(backend='a2a', owned_counts=...)` branch behind an early return |
+| `atom/spec_decode/draft_kv.py` | pool `world_size` = `tp // dcp`, read off `model_runner.config` (NOT `get_dcp_world_size()` -- this runs from the proposer's `__init__`, before the global config may exist) |
+| `atom/spec_decode/dspark_proposer.py` | true local KV count in new preallocated `_blk_owned_req`/`_blk_owned_counts` (allocated ONLY under DCP); `ctx_lens` floored at 1 for the kernel; `attn_metadata.dcp_owned_counts` published; pad tail given a non-zero count so it cannot merge to NaN |
+| `atom/config.py` | refuse DCP>1 + a non-MLA draft that is not the DFlash block drafter |
+| `tests/test_dflash_draft.py` | +5 tests: pool built at tp_eff (the PLUMBING, which the existing invariance test does not cover), the QKV-override regression test, the sibling-refusal test, the `ctx_lens == 0` reachability test |
+| `tools/dflash_ab.sh` | `DCP=<n>` knob; emits NO flag at DCP=1 |
+| `tools/phase1_tp8.py` | parameterized on `DCP`; replication oracle at tp_eff < tp |
+| `tools/m0_lse_merge.py` | NEW: the LSE-convention probe |
 
 ### Still open after M4
 
-- Perf at DCP8 is UNMEASURED. The merge adds one `all_to_all_single` per draft
-  layer per block pass (5 per step). `gsm8k` reports accuracy and acceptance,
-  not tok/s. Run `perf` / `swebench` at DCP=8 before quoting any throughput.
+- **Design 4.3 items 1 and 2 are SUPERSEDED and should be dropped from scope**,
+  not left looking undone. The draft never enters `attention_mha.py`: `forward`
+  calls mha_v3 directly and `self.attn` exists only so `DraftKvBuilder` can key
+  its pool walk. Making the persistent path keep its LSE, or adding
+  `paged_attention_lse`, would touch a file on the TARGET's hot path for zero
+  M4 benefit -- a DCP1 risk for nothing.
+- `dspark_proposer.py`'s hand-rolled DCP slot arithmetic is CORRECT at S=1
+  (equal elementwise to `dcp_owner_rank`/`dcp_local_index`) but is not
+  S-general while the target's write path is. S>1 + spec is config-refused, so
+  this is a maintainability refactor, not a bug.
+- ~~Perf at DCP8 is UNMEASURED.~~ **MEASURED 2026-10-06 — and it costs 7.9% of
+  single-stream throughput.** The merge adds one `all_to_all_single` per draft
+  layer per block pass (5 per step), and at `perf` (64x512, bs=1) there is
+  nothing to overlap them with:
+
+  | `perf` 64x512 bs=1 | DCP1 (banked) | DCP8 | delta |
+  |---|---|---|---|
+  | output tok/s | 111.41 | **102.55** | **-7.9%** |
+  | wall | 292.6 s | 319.4 s | +9.2% |
+  | accept_length | 3.046 | 2.878 | **-0.169** |
+  | acceptance | 40.93% | 37.55% | -3.38 pp |
+
+  **Do NOT quote the -0.169 as a DCP8 acceptance regression — the control is
+  STALE.** The banked DCP1 `perf` run predates both the DCP work and
+  `8a588af01`, so this is a cross-build comparison. On GSM8K, where both arms
+  are same-generation, the delta is **-0.01**, not -0.169. A DCP1 `perf`
+  control on today's build is the missing run (~12 min); `perf_dcp1/` was
+  created but never populated. Until it exists, DCP8 `perf` is measured but
+  **not validated**.
+  Also note DCP is a CAPACITY lever, not a latency one: bs=1 single-stream is
+  the workload it should look worst on, and `swebench` at DCP=8 is still unrun.
 - The +2.10 GB/rank is the QKV weight replication. **S2.4's DCP-invariance
   claim is about the KV POOL only** -- head replication cancels token sharding
   there exactly, but WEIGHTS do not cancel, and the design does not say so.
   Budget it explicitly.
-- `tools/phase1_tp8.py` was NOT parameterized on DCP. The loader at tp_eff=1 is
-  proven by the run starting and by the unit test, not by the bitwise
-  safetensors oracle that proved DCP1.
+- ~~`tools/phase1_tp8.py` was NOT parameterized on DCP.~~ **DONE — it now is,
+  and the DCP8 loader is proven BITWISE.** `DCP=8 python3 tools/phase1_tp8.py`
+  (8 real ranks, ATOM's real `load_model`, compared against slices of the raw
+  safetensors; ~1 min, no server):
+  - every rank's `qkv_proj` is `[6144, 7168]`, i.e. the FULL q+k+v, and is
+    **sha-identical across all 8 ranks** -- head replication proved, not argued
+    (`REPLICATED L*.qkv rank*` checks, all True);
+  - `o_proj` is still `[7168, 512]` with `colmatch -> [tp_rank]`: direct proof
+    it stayed at full TP and was untouched by DCP;
+  - `gate_up`/`down` unchanged at 1792 (no head axis, still full-TP sharded);
+  - `DCP=1` reproduces `tools/phase1_tp8_rank*.json` check-for-check (diffed),
+    which is the independent "DCP1 did not move" proof at the LOADER level.
+  Results are banked in `tools/phase1_tp8_dcp8_rank*.json`. Note the
+  `ALT_tp1_contiguous_slice` detector is vacuously true at tp_eff == 1 (there
+  is only one shard, so the whole weight IS the slice) and is now gated on
+  `tp_eff > 1`.
 
 ## NEEDS HUMAN — loop STOPPED 2026-10-06 (cron job 33714f3d deleted)
 
@@ -353,8 +442,12 @@ than guess. Nothing is half-finished; no run is in flight; GPUs are free.
    layout and sizing is a design choice, not a mechanical port. I did not want to
    invent a plausible-looking config unattended.
 
-4. **M4 / DCP8.** Explicitly gated, and DCP + a non-MLA draft is broken in vLLM
-   and SGLang too (vllm#59184, #57992; sglang#34920). Worth a deliberate go/no-go.
+4. ~~**M4 / DCP8.**~~ **DONE 2026-10-06 — see the M4 section above.** It works
+   and the acceptance oracle passes (+0.04 toks/fwd vs DCP1). vLLM #59184 /
+   #57992 and SGLang #34920 remain broken for this combination; our position
+   differed because the draft owns a single explicit kernel path, the read is
+   local to `kimi_k3_dflash.py` rather than the DCP-blind shared MHA backend,
+   mha_v3 already returns the LSE, and `dcp_lse_merge` is head-agnostic.
 
 ### Out of scope, escalate elsewhere
 **Prefix caching returns a 0.0% hit rate on Kimi-K3 even with NO draft loaded**
@@ -1424,9 +1517,20 @@ deleted. Verified: **0 `BENCH-ONLY` markers in live code**, and the four ATOM
 engine files (`engine_stats`, `scheduler`, `engine_utility`, `llm_engine`) are
 back to HEAD with no diff.
 
-**Saved for reuse at `tools/bench_only_patch/`** — `.patched` full copies,
-`.patch` reapply diffs (663 lines total), and the unit test. To reapply:
-copy the `.patched` files back, or `patch -p0 < *.patch` against the `.orig`s.
+**Saved for reuse on the DEV branch `rbrugaro/k3-dflash-draft` at
+`tools/bench_only_patch/`** — `.patched` full copies, `.patch` reapply diffs
+(663 lines total), and the unit test. To reapply: copy the `.patched` files
+back, or `patch -p0 < *.patch` against the `.orig`s.
+
+**It is deliberately NOT on this share branch.** Four of those `.patched`
+files are verbatim full copies of ATOM engine source (`scheduler.py` at 211 KB,
+plus `llm_engine.py`, `engine_stats.py`, `engine_utility.py`). Shipping
+engine-source snapshots inside `tools/` on a branch another team applies in CI
+invites someone to mistake them for live code, and this instrumentation was
+reverted precisely because it must not be upstreamed. Fetch it from the dev
+branch if you need it:
+
+    git show rbrugaro/k3-dflash-draft:tools/bench_only_patch/<file>
 
 **KEPT (not reverted): the aux-aggregate fix** in
 `atom/spec_decode/dspark_proposer.py` (`ATOM_K3_AUX_AGGREGATE=1`). That is the
