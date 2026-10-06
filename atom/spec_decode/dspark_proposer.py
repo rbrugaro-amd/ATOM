@@ -1,4 +1,6 @@
+import dataclasses
 import logging
+import os
 
 import torch
 from torch import nn
@@ -508,12 +510,217 @@ class DSparkProposer(Drafter):
             )
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
-        return AuxCaptureSpec(
-            layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
+            spec = own(layer_ids, self.config.hf_config.hidden_size)
+        else:
+            spec = AuxCaptureSpec(
+                layer_ids=layer_ids,
+                hidden_size=self.config.hf_config.hidden_size,
+                extract=self._extract_layer_hidden,
+            )
+        # Kimi-K3's residual stream is a BANK of per-12-layer snapshots plus a
+        # running prefix, recombined by a softmax mixture. The raw wire carries
+        # only the current block's prefix. A draft trained by SpecForge against
+        # a live SGLang target was trained on the MIXTURE (SGLang's dspark aux
+        # tap calls `aggregate_stream`), so feeding it the raw prefix feeds it a
+        # feature it never saw. Measured on GSM8K n=1319 at k=5: acceptance
+        # 55.61% -> 62.04%, +6.43 pp, accuracy unchanged within noise.
+        #
+        # DEFAULT ON. It is gated only so it can be turned OFF for an A/B; an
+        # unset env must NOT silently select the worse feature, which is what a
+        # default-off flag does in CI.
+        #
+        # Correctly, the same flag makes a vLLM/HF-trained draft (e.g.
+        # Inferact/Kimi-K3-DSpark, `_torchspec_version` in its config) WORSE by
+        # ~2.6 pp -- that draft wants the raw prefix. Routing this by draft
+        # PROVENANCE rather than a global default is the open design question;
+        # until then set ATOM_K3_AUX_AGGREGATE=0 for such a draft.
+        #   ATOM_K3_AUX_AGGREGATE=0 -- feed the RAW PREFIX (pre-fix behaviour).
+        #   ATOM_K3_AUX_PROBE=1     -- additionally log prefix-vs-aggregate cos.
+        report = os.getenv("ATOM_K3_AUX_PROBE", "0") == "1"
+        feed_aggregate = os.getenv("ATOM_K3_AUX_AGGREGATE", "1") == "1"
+        if report or feed_aggregate:
+            spec = self._arm_k3_aux_aggregate(
+                target_model, spec, report=report, feed_aggregate=feed_aggregate
+            )
+        return spec
+
+    # ------------------------------------------------------------------
+    # K3 AGGREGATE TAP -- see _aux_capture_spec for why this is default ON.
+    #
+    # Question: Kimi-K3 does not carry a plain pre-norm residual stream. It
+    # carries a BANK of per-`attn_res_block_size` snapshots plus a RUNNING
+    # PREFIX, recombined by a softmax mixture. ATOM's aux tap
+    # (`KimiDecoderLayer.aux_hidden_state`) returns the raw prefix and discards
+    # the bank; SGLang's dspark aux tap returns the mixture
+    # (`aggregate_stream`).
+    #
+    # Two independent envs, both default OFF:
+    #   ATOM_K3_AUX_PROBE=1     measures how far apart those two tensors are on
+    #                           real activations and logs it. Non-behavioural.
+    #   ATOM_K3_AUX_AGGREGATE=1 makes the wrapped extract RETURN the aggregate,
+    #                           i.e. feeds the draft SGLang's feature. This is
+    #                           the falsifier arm; it is the ONLY behavioural
+    #                           switch here.
+    # With both unset nothing below is constructed or called.
+    #
+    # NOTE: with BOTH set, the probe's cos/L2 numbers degenerate (the aux buffer
+    # it reads as "prefix" now holds the aggregate, so cos==1). Use PROBE alone
+    # to measure, AGGREGATE alone to run the A/B.
+    # ------------------------------------------------------------------
+    _k3_probe = None  # class attribute: probe state, or None when disabled
+    _k3_probe_steps = 0
+
+    def _arm_k3_aux_aggregate(
+        self,
+        target_model: nn.Module,
+        spec: AuxCaptureSpec,
+        *,
+        report: bool,
+        feed_aggregate: bool,
+    ):
+        """Wrap ``spec.extract`` so it computes the K3 aggregate stream.
+
+        Reuses ATOM's own mixture (`AttnRes` / `apply_attn_res`) rather than
+        transcribing SGLang's: the scoring weight is the NEXT layer's
+        `self_attention_attn_res.score_weight` (= `self_attention_res_norm.weight *
+        self_attention_res_proj.weight`, folded at load) and the mixture is the
+        same fused kernel the model runs, called with ``out_norm_weight=None``
+        so the result comes back un-normed -- which is exactly SGLang's
+        "softmax mixture, no output norm".
+
+        `kimi_k3.py` is `@support_torch_compile` and must not be edited, so the
+        whole probe lives here, at the hook's call site.
+        """
+        from atom.spec_decode.drafter import _resolve_decoder_layers
+
+        layers = _resolve_decoder_layers(target_model)
+        base_extract = spec.extract
+        taps: list[tuple] = []
+        probe: dict[int, dict] = {}
+        hidden = spec.hidden_size
+        for buf_idx, lid in enumerate(spec.layer_ids):
+            if lid < 0 or lid + 1 >= len(layers):
+                continue
+            res = getattr(layers[lid + 1], "self_attention_attn_res", None)
+            if res is None or not getattr(res, "enabled", False):
+                continue
+            block_size = res.block_size
+            if not block_size:
+                continue
+            # CEILING division, matching SGLang's `prev_valid_blocks`.
+            nvb = -(-(lid + 1) // block_size)
+            if nvb <= 0:
+                continue
+            # Reporting buffers only; the aggregate FED to the draft goes
+            # straight into the base hook's own aux buffer (in place, there).
+            agg = probs = None
+            if report:
+                agg = torch.zeros(
+                    self.max_num_tokens, hidden, device=self.device, dtype=self.dtype
+                )
+                probs = torch.zeros(
+                    self.max_num_tokens,
+                    nvb + 1,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            # A plain int attribute on the tapped layer, not an id()/dict lookup:
+            # the extract runs inside the target's traced region, where Dynamo
+            # constant-folds a module int attribute but graph-breaks on id().
+            # This sets a runtime attribute; it does not touch kimi_k3.py.
+            layers[lid]._k3_probe_tap = len(taps)
+            taps.append((lid, nvb, res, agg, probs))
+            probe[lid] = {"nvb": nvb, "agg": agg, "probs": probs, "buf": buf_idx}
+        if not taps:
+            logger.warning(
+                "ATOM_K3_AUX_PROBE/ATOM_K3_AUX_AGGREGATE set but no K3 "
+                "attn-residual taps found"
+            )
+            return spec
+        if report:
+            self._k3_probe = probe
+        logger.info(
+            "K3 aggregate tap armed on %s (nvb=%s, report=%s, feed_aggregate=%s)",
+            sorted(probe),
+            [probe[k]["nvb"] for k in sorted(probe)],
+            report,
+            feed_aggregate,
         )
+
+        def extract(output, block):
+            prefix = base_extract(output, block)
+            tap_idx = getattr(block, "_k3_probe_tap", -1)
+            if prefix is None or tap_idx < 0:
+                return prefix
+            _lid, nvb, res, agg_buf, probs_buf = taps[tap_idx]
+            bank = output[-1]
+            if bank is None or bank.shape[1] < nvb:
+                return prefix
+            bank = bank[:, :nvb, :]
+            score_weight = res.score_weight
+            if score_weight is None:  # loader hook did not run (plugin hosts)
+                res.process_weights_after_loading()
+                score_weight = res.score_weight
+            from atom.model_ops.kimi_k3 import apply_attn_res
+
+            mixed, _ = apply_attn_res(
+                prefix, bank, score_weight, res.eps, None, None, res.out_eps
+            )
+            if report:
+                # The softmax mass itself -- the interpretable number. Recomputed
+                # in plain torch because the fused kernel keeps `probs` in
+                # registers.
+                rows = torch.cat([bank, prefix.unsqueeze(1)], dim=1).float()
+                normed = rows * torch.rsqrt(
+                    rows.pow(2).mean(-1, keepdim=True) + res.eps
+                )
+                probs = torch.softmax((normed * score_weight).sum(-1), dim=-1)
+                off = get_forward_context().context.ubatch_token_offset
+                n = prefix.shape[0]
+                agg_buf[off : off + n].copy_(mixed)
+                probs_buf[off : off + n].copy_(probs)
+            # The ONLY behavioural switch. `mixed` is handed to the base aux
+            # hook, which copies it in place into the fixed capture buffer it
+            # would otherwise have filled with `prefix` -- same buffer, same
+            # shape, so cudagraph capture is unaffected.
+            return mixed if feed_aggregate else prefix
+
+        return dataclasses.replace(spec, extract=extract)
+
+    def _k3_probe_report(self, num_tokens: int) -> None:
+        """Log prefix-vs-aggregate divergence for the rows of the last target
+        forward. Host-syncing, so it runs outside any compiled region."""
+        type(self)._k3_probe_steps += 1
+        step = type(self)._k3_probe_steps
+        if step > 3:
+            return
+        for lid, info in sorted(self._k3_probe.items()):
+            prefix = self._aux_buffers[info["buf"]][:num_tokens].double()
+            agg = info["agg"][:num_tokens].double()
+            probs = info["probs"][:num_tokens].double()
+            keep = prefix.pow(2).sum(-1) > 0
+            if not bool(keep.any()):
+                continue
+            prefix, agg, probs = prefix[keep], agg[keep], probs[keep]
+            cos = torch.nn.functional.cosine_similarity(prefix, agg, dim=-1)
+            rel = (agg - prefix).norm(dim=-1) / prefix.norm(dim=-1).clamp_min(1e-12)
+            prefix_mass = probs[:, -1]
+            logger.info(
+                "K3_AUX_PROBE step=%d tap=%d nvb=%d rows=%d "
+                "cos_mean=%.6f cos_min=%.6f relL2_mean=%.4f relL2_max=%.4f "
+                "prefix_mass_mean=%.4f prefix_mass_min=%.4f bank_mass_mean=%.4f",
+                step,
+                lid,
+                info["nvb"],
+                int(keep.sum()),
+                cos.mean().item(),
+                cos.min().item(),
+                rel.mean().item(),
+                rel.max().item(),
+                prefix_mass.mean().item(),
+                prefix_mass.min().item(),
+                1.0 - prefix_mass.mean().item(),
+            )
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):
@@ -645,6 +852,8 @@ class DSparkProposer(Drafter):
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
             )
+        if self._k3_probe is not None:  # MEASUREMENT-ONLY (ATOM_K3_AUX_PROBE=1)
+            self._k3_probe_report(target_hidden_states.shape[0])
         # aux is validated here (drafting requires it) but the target context is
         # already in the draft's KV: `compute_draft_kv` absorbed it right
         # after the target forward, uniformly for every flavor. propose() only
