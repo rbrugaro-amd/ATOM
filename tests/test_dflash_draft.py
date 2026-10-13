@@ -590,7 +590,11 @@ def test_sibling_qkv_layers_refuse_an_override_rather_than_swallow_it(
     group = types.SimpleNamespace(world_size=8, rank_in_group=0)
     with (
         mock.patch.object(lin, "get_tp_group", lambda: group),
-        pytest.raises(AssertionError, match="effective-TP override"),
+        # `TypeError`, not `AssertionError`: these layers RAISE rather than
+        # assert, precisely so `python -O` cannot strip the guard. The patch
+        # series this test came from still expected the older `assert`
+        # spelling that the very same patch had already replaced.
+        pytest.raises(TypeError, match="effective-TP override"),
     ):
         cls(*args, override_tp_size=1, override_tp_rank=0)
 
