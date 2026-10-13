@@ -1939,8 +1939,18 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            # The CHECKPOINTING builder's own per-block bytes, not the merged
+            # PAGE class total. A draft that owns a KV pool joins the target's
+            # entry class (DraftKvBuilder.sub_pool_specs -> page_pool), so the
+            # class total is target + draft -- but the state image is tucked
+            # into the TARGET's attention regions, which is all
+            # `_page_unit_regions` enumerates. Using the merged total makes the
+            # two disagree by exactly the draft's entry_bytes, and the
+            # granularity check raises. The draft's rows are derived state,
+            # rewritten from the target's hidden states every step, so they are
+            # not part of the image and must not be part of its unit.
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                page_unit_bytes=self.attn_metadata_builder.paged_pool_bytes(1),
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,

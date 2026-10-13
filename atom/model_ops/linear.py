@@ -1796,6 +1796,17 @@ class QKVZBAParallelLinear(ColumnParallelLinear):
         self.head_v_dim = head_v_dim
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
+        # This class derives its head counts and output_sizes from `tp_size`
+        # below, so an effective-TP override would have to be threaded through
+        # here as well as into `LinearBase` (see `QKVParallelLinear`). Refuse it
+        # rather than swallow it into `**kwargs` and shard on the full TP group.
+        if "override_tp_size" in kwargs or "override_tp_rank" in kwargs:
+            # `raise`, not `assert`: `python -O` strips asserts, and a stripped
+            # guard restores the exact silent mis-shard it exists to prevent.
+            raise TypeError(
+                f"{type(self).__name__} does not support an effective-TP "
+                "override; it derives its head counts from the full TP group."
+            )
         tp_size = get_tp_group().world_size
         self.num_k_heads = divide(self.num_k_heads, tp_size)
         self.num_v_heads = divide(self.num_v_heads, tp_size)
@@ -1977,6 +1988,17 @@ class QKVZParallelLinear(ColumnParallelLinear):
     ):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
+        # This class derives its head counts and output_sizes from `tp_size`
+        # below, so an effective-TP override would have to be threaded through
+        # here as well as into `LinearBase` (see `QKVParallelLinear`). Refuse it
+        # rather than swallow it into `**kwargs` and shard on the full TP group.
+        if "override_tp_size" in kwargs or "override_tp_rank" in kwargs:
+            # `raise`, not `assert`: `python -O` strips asserts, and a stripped
+            # guard restores the exact silent mis-shard it exists to prevent.
+            raise TypeError(
+                f"{type(self).__name__} does not support an effective-TP "
+                "override; it derives its head counts from the full TP group."
+            )
         tp_size = get_tp_group().world_size
         self.nk = divide(num_k_heads, tp_size)
         self.nv = divide(num_v_heads, tp_size)
@@ -2085,6 +2107,17 @@ class BAParallelLinear(ColumnParallelLinear):
         prefix: str = "",
         **kwargs,
     ):
+        # This class derives its head counts and output_sizes from `tp_size`
+        # below, so an effective-TP override would have to be threaded through
+        # here as well as into `LinearBase` (see `QKVParallelLinear`). Refuse it
+        # rather than swallow it into `**kwargs` and shard on the full TP group.
+        if "override_tp_size" in kwargs or "override_tp_rank" in kwargs:
+            # `raise`, not `assert`: `python -O` strips asserts, and a stripped
+            # guard restores the exact silent mis-shard it exists to prevent.
+            raise TypeError(
+                f"{type(self).__name__} does not support an effective-TP "
+                "override; it derives its head counts from the full TP group."
+            )
         tp_size = get_tp_group().world_size
         self.nk = divide(num_k_heads, tp_size)
         self.R = num_v_heads // num_k_heads
@@ -2138,6 +2171,17 @@ class QKVGParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
+        # This class derives its head counts and output_sizes from `tp_size`
+        # below, so an effective-TP override would have to be threaded through
+        # here as well as into `LinearBase` (see `QKVParallelLinear`). Refuse it
+        # rather than swallow it into `**kwargs` and shard on the full TP group.
+        if "override_tp_size" in kwargs or "override_tp_rank" in kwargs:
+            # `raise`, not `assert`: `python -O` strips asserts, and a stripped
+            # guard restores the exact silent mis-shard it exists to prevent.
+            raise TypeError(
+                f"{type(self).__name__} does not support an effective-TP "
+                "override; it derives its head counts from the full TP group."
+            )
         tp_size = get_tp_group().world_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if self.total_num_kv_heads >= tp_size:
@@ -2279,13 +2323,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         v_head_size: int | None = None,
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
         **kwargs,
     ):
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = get_tp_group().world_size
+        # Effective-TP override, declared EXPLICITLY rather than left to
+        # `**kwargs`: this class derives num_heads / num_kv_heads /
+        # output_sizes from `tp_size` itself, so an override that only reached
+        # `LinearBase` would size the parameter one way and shard the load
+        # another. Swallowing it silently produced a layer that looked
+        # overridden and was not -- no error, wrong sharding.
+        tp_size = (
+            override_tp_size
+            if override_tp_size is not None
+            else get_tp_group().world_size
+        )
         self.num_heads = divide(self.total_num_heads, tp_size)
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
@@ -2312,6 +2368,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(
@@ -2385,6 +2443,17 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             raise ValueError(
                 "MiniMax-M3 index_q must shard like KV heads: "
                 "total_num_index_heads must equal total_num_kv_heads."
+            )
+        # This subclass bypasses `QKVParallelLinear.__init__` entirely and calls
+        # `ColumnParallelLinear.__init__` itself, so the override plumbing added
+        # to the parent does NOT reach it: the kwarg would ride `**kwargs` into
+        # `LinearBase` (setting tp_size/tp_rank) while the head counts below are
+        # still derived from the FULL TP group -- the exact silent, unrecoverable
+        # (head x token) double-shard the override exists to avoid. Refuse it.
+        if "override_tp_size" in kwargs or "override_tp_rank" in kwargs:
+            raise TypeError(
+                f"{type(self).__name__} does not support an effective-TP "
+                "override; it derives its head counts from the full TP group."
             )
 
         self.head_size = head_size
