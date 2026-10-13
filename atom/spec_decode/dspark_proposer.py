@@ -1786,9 +1786,38 @@ class DSparkProposer(Drafter):
                 # each entry under DCP8 and alias eight requests onto one page.
                 from atom.model_ops.attentions.sglang_port.kv_indices import (
                     create_flashinfer_kv_indices_triton,
+                    kv_indices_num_token_blocks,
                 )
 
-                create_flashinfer_kv_indices_triton[(running_bs,)](
+                # 2D grid, as SGLang launches the SAME kernel
+                # (`aiter_backend.py:2043-2052`). The 1D form this replaced ran
+                # ONE program per request, crawling the whole context serially
+                # -- the failure mode the kernel's own docstring names
+                # (kv_indices.py:45-50): "one program crawling the whole
+                # context serially (which bottlenecks long-context spec decode,
+                # where this kernel runs every iteration)". ATOM vendored
+                # `kv_indices_num_token_blocks` for this and never called it.
+                #
+                # It matters HERE and not for the MLA draft because this draft
+                # is not in the dcp group: it crawls the FULL context where a
+                # DCP8 draft crawls 1/8, so at C32/131k it was 256 serial
+                # iterations per program against Inferact's 32. That is linear
+                # in context, which is why Path B's forward rate DECAYS (1.03
+                # -> 0.73) while Inferact's holds. SGLang runs 16 blocks per
+                # request at the identical draft-DCP1 shape and does not decay.
+                #
+                # `table_width` is STATIC -- the padded table's token span. Do
+                # NOT use `prefix_lens.max()`: it is a device tensor, so that
+                # would sync the host on every draft step and cost more than
+                # this saves. The helper saturates at `512 // bs` anyway, so a
+                # bound is as good as the exact length (both give 16 at C32).
+                num_token_blocks = kv_indices_num_token_blocks(
+                    block_tables.shape[1] * entry_tokens, running_bs
+                )
+
+                create_flashinfer_kv_indices_triton[
+                    (running_bs, num_token_blocks)
+                ](
                     block_tables,
                     self._blk_req_rows[:running_bs],
                     prefix_lens,
@@ -1799,6 +1828,7 @@ class DSparkProposer(Drafter):
                     self._blk_kv_indices,
                     block_tables.stride(0),
                     ENTRY_PAGE_SIZE=entry_tokens,
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
             else:
                 kv_indices_generate_triton(

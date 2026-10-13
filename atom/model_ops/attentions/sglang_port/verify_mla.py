@@ -21,7 +21,31 @@ import triton.language as tl
 _AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16}
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
-TARGET_PROGRAMS = 512  # Target total stage-1 programs
+# Target total stage-1 programs. This is a TOTAL budget divided by
+# `bs * n_head_blocks`, so per-request parallelism SHRINKS as batch grows --
+# and the serial loop each program walks is `seqlen / active_splits`, so the
+# starvation is worst exactly where context is longest.
+#
+# At 512 and ISL 131072 on TP8 (n_head_blocks=2):
+#     bs= 8 -> 32 splits,  4096 tokens/program
+#     bs=32 ->  8 splits, 16384 tokens/program   <-- the C32 production shape
+# i.e. the C32 batch did 4x the serial work per program while the grid stayed
+# pinned near 512 -- two waves on a 256-CU MI355X, badly under-occupied for a
+# memory-bound long-context read. Measured 1873 us/step at bs~12, 60% of the
+# draft window; at bs=32 each program crawls 2.6x further than that.
+#
+# 2048 lets bs=32 reach MAX_N_SPLITS (2048 // (32*2) = 32), i.e. 4096
+# tokens/program -- the SAME per-program work the kernel already does at bs<=8
+# today, so this extends an existing regime rather than introducing one.
+# Costs no memory: `_alloc` already sizes `att_out`/`att_lse` by MAX_N_SPLITS,
+# so the split count cannot exceed what is already reserved. Splitting is a
+# partition of the same reduction combined through the stage-2 LSE, and the
+# split count ALREADY varies 32->4 across batch sizes, so accumulation order
+# was never fixed to begin with.
+#
+# Same failure mode as patch 0013 (the 1D CSR launch grid): a grid sized by a
+# constant tuned for a smaller shape, leaving each program crawling serially.
+TARGET_PROGRAMS = 2048
 
 DEFAULT_BLOCK_H = (
     4  # BLOCK_H must be a power of 2 (tl.arange); heads beyond H_Q are masked.
@@ -165,7 +189,29 @@ def _verify_mla_prefix_stage1(
             n_mask = offs_n < split_end
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_mask, other=0
-            )
+            ).to(tl.int64)
+            # LOCAL FIX to the vendored kernel, not an SGLang difference.
+            #
+            # `kv_indices` is int32 and `kv_loc * stride_buf_kbs` was evaluated
+            # in int32, so the flat element offset wraps at 2**31. With
+            # stride_buf_kbs = num_kv_heads * head_dim = 2 * 64 = 128 that is
+            # pool entry 2**31 / 128 = 16384. ATOM allocated 17635 entries, so
+            # the top 7.1% of the pool addressed ~2.3 GB BELOW the buffer --
+            # still inside ATOM's single paged allocation, so it read silent
+            # garbage rather than faulting. Measured boundary: entry 16383
+            # correct, entry 16384 wrong, exactly as predicted.
+            #
+            # This is why acceptance length DECAYED (3.00 -> 1.52) instead of
+            # being wrong from the start: the block allocator hands out low ids
+            # first, so early requests are clean, and a request is poisoned only
+            # once it touches an entry past 16384. At ISL 131072 a request spans
+            # ~128 entries, so that becomes near-certain as the pool fills.
+            #
+            # SGLang does not hit this because it pages at ENTRY_PAGE_SIZE 1,
+            # where a slot id is a token index; our entry_tokens = block_size *
+            # dcp = 1024 makes the same context produce ids 1024x larger. Their
+            # own id GENERATOR already casts (kv_indices.py:97, `entry.to(
+            # tl.int64) * ENTRY_PAGE_SIZE`) -- only this consumer did not.
             base = kv_loc[None, :] * stride_buf_kbs + kv_head_off_k
             k_nope = tl.load(
                 K_Buffer + base + offs_dn[:, None],
