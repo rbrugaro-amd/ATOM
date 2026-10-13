@@ -742,6 +742,14 @@ class KimiK3DFlash(DSparkDraftModel):
     `SpeculativeConfig.hf_config_override` renames it.
     """
 
+    # This flavor's markov head is `kimi_k3_dspark.DSparkMarkovHead` -- the very
+    # same class the Inferact draft uses, imported above -- so it already
+    # provides `sample_next_q`, and `_sample_block` below branches on the
+    # binding. `DSparkProposer` may therefore arm lossless speculative sampling
+    # here. See `DSparkDraftModel.supports_lossless_draft` for why this is an
+    # explicit flag and not a `hasattr` probe on the head.
+    supports_lossless_draft = True
+
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -846,6 +854,15 @@ class KimiK3DFlash(DSparkDraftModel):
         Only this loop is sequential, and it is T rank-256 matmuls rather than T
         backbone passes -- which is the point of DSpark.
         """
+        # Lossless speculative sampling draws x_k from softmax(biased / T) and
+        # publishes that q for the ratio accept rule. Branched HERE and not
+        # inside the loop: the block head is CAPTURED, so whichever side is
+        # taken at warmup is the one every replay runs, which is why
+        # `bind_draft_sampling` is settled at drafter init. Mirrors
+        # `kimi_k3_dspark.KimiK3DSpark._sample_block`; the shared body lives in
+        # `DSparkDraftModel.sample_block_lossless`, so the two cannot drift.
+        if self.draft_sampling is not None:
+            return self.sample_block_lossless(base_logits, anchor_ids)
         bs, num_draft, _ = base_logits.shape
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
