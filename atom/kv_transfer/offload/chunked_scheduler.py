@@ -247,11 +247,21 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         budget = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
         memo = self._tier_hit_memo or {}
         pending = client.pending_ids()
+        # A client that hands discarded pins back to the scheduler
+        # (`ThreadedLookupClient`) must not lookup an ID whose pin is still
+        # awaiting its release in this step's metadata.
+        unpin_pending = (
+            self._lookup_in_step
+            if callable(getattr(client, "pop_unpin_ids", None))
+            else ()
+        )
         for seq in seqs:
             if budget <= 0:
                 break
             sid = str(seq.id)
             if sid in pending or sid in self._lookup_results or sid in self._load_specs:
+                continue
+            if sid in unpin_pending:
                 continue
             entry = memo.get(sid)
             if entry is not None and entry[0]() is seq:
@@ -811,6 +821,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             meta.add_request(
                 self._build_load_request(seq, ls, load_operation, transfer_end)
             )
+        self._drain_released_lookups()
         meta.lookup_requests_in_step = [
             sid
             for sid in self._lookup_in_step
@@ -1089,7 +1100,48 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             or bool(getattr(self, "_save_lease_blocks", {}))
             or pending_finished_save
             or any(sid not in self._load_specs for sid in self._lookup_in_step)
+            or self._lookup_client_has_orphans()
         )
+
+    def _lookup_client_has_orphans(self) -> bool:
+        """The lookup client still holds a discarded lookup's pin or locks.
+
+        Keeps an otherwise idle engine stepping until the release goes out:
+        through a metadata's unpin list for `ThreadedLookupClient`
+        (`_drain_released_lookups`), through the client's own pump for
+        lmcache_mp. Either is bounded: a discarded lookup answers or is given
+        up within the lookup transport's timeout.
+        """
+        # Read defensively: test doubles assemble schedulers without __init__.
+        client = getattr(self, "_lookup_client", None)
+        orphans = getattr(client, "has_orphans", None)
+        return bool(callable(orphans) and orphans())
+
+    def _drain_released_lookups(self) -> None:
+        """Unpin lookups a background client will never hand to admission.
+
+        Only `ThreadedLookupClient` has `pop_unpin_ids`: its discarded (aborted,
+        finished, detached) lookups pinned chunks on the workers under the
+        request's ID, and the only release is the metadata's unpin list. The
+        client returns an ID only once its lookup has answered, so the unpin
+        cannot overtake the pin.
+        """
+        # Read defensively: test doubles assemble schedulers without __init__.
+        client = getattr(self, "_lookup_client", None)
+        pop_unpins = getattr(client, "pop_unpin_ids", None)
+        if not callable(pop_unpins):
+            return
+        for sid in pop_unpins():
+            if sid not in self._lookup_in_step:
+                self._lookup_in_step.append(sid)
+        self.reconcile_detached_lookups()
+        for key, value in client.pop_counters().items():
+            key = "async_lookup_" + key
+            if key.endswith("_max_us"):
+                self._perf_bump(key, 0)
+                self._perf_counters[key] = max(self._perf_counters[key], value)
+            else:
+                self._perf_bump(key, value)
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)

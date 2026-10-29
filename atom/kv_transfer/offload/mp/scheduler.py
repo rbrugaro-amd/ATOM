@@ -363,20 +363,16 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._end_finished_sessions()
 
     def has_pending_work(self) -> bool:
-        """Also report pending session ends and unreleased discarded lookups.
+        """Also report pending session ends.
 
         A detached lookup can outlive its request. If no other request is
-        running, nothing else steps the connector, so without this the lookup
-        is never pumped and its session never ends. Both are bounded: a
-        discarded lookup is given up after `_ORPHAN_TIMEOUT_S`, and a session
-        waits only for its saves and its lookup.
+        running, nothing else steps the connector, so without this (and the
+        base class's `_lookup_client_has_orphans`) the lookup is never pumped
+        and its session never ends. Both are bounded: a discarded lookup is
+        given up after `_ORPHAN_TIMEOUT_S`, and a session waits only for its
+        saves and its lookup.
         """
-        orphans = getattr(self._lookup_client, "has_orphans", None)
-        return (
-            super().has_pending_work()
-            or bool(self._pending_session_ends())
-            or bool(callable(orphans) and orphans())
-        )
+        return super().has_pending_work() or bool(self._pending_session_ends())
 
     def _pending_session_ends(self) -> dict[str, Any]:
         """Finished requests whose MP session must outlive their last save.

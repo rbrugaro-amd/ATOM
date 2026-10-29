@@ -101,6 +101,7 @@ Four rules carry the module:
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
+| `async_lookup.py` | `ThreadedLookupClient`: the in-process LMCache lookup client on a background thread (`OFFLOAD_LOOKUP_THREAD`), with prefetch and pin release through the metadata's unpin list. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |

@@ -1306,6 +1306,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # Run the in-process (ZMQ) LMCache lookup client on a background thread:
+    # waiting requests' lookups are sent ahead of admission and admission
+    # consumes the answer (`atom/kv_transfer/offload/async_lookup.py`).
+    "OFFLOAD_LOOKUP_THREAD": lambda: _flag_env("OFFLOAD_LOOKUP_THREAD"),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(

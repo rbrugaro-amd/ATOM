@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from atom.kv_transfer.offload.async_lookup import UNCONSUMED_HOLD_FRACTION
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
 
@@ -42,11 +43,6 @@ _ASYNC_LOOKUP_FAILED = (
 # The MP server's `--l1-read-ttl-seconds` when `lmcache.mp.read_ttl_seconds`
 # does not say otherwise (LMCache's own default).
 _DEFAULT_READ_TTL_S = 300.0
-# Fraction of the read TTL the lookup driver lets an answered lookup wait for
-# its request's admission before releasing its read locks and asking again.
-# Well below 1: a lookup that outlives the TTL hands the retrieve chunks the
-# server may already have evicted.
-_UNCONSUMED_HOLD_TTL_FRACTION = 0.4
 
 
 def _locked(method):
@@ -116,7 +112,8 @@ class _MPLookupClient:
         self._offered: OrderedDict[str, Callable[[], list[int] | None]] = OrderedDict()
         # When each unconsumed async hit was answered (monotonic seconds).
         self._answered_at: dict[str, float] = {}
-        self._max_unconsumed_hold_s = read_ttl_s * _UNCONSUMED_HOLD_TTL_FRACTION
+        # Released and re-asked before the read locks can expire.
+        self._max_unconsumed_hold_s = read_ttl_s * UNCONSUMED_HOLD_FRACTION
         self.driver_stats = {"sent": 0, "stale_released": 0}
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter

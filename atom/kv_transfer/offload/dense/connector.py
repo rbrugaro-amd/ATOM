@@ -66,6 +66,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -517,6 +518,21 @@ class DenseOffloadScheduler(ChunkedOffloadSchedulerBase):
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
+            )
+        if lookup_client is not None and envs.OFFLOAD_LOOKUP_THREAD:
+            from atom.kv_transfer.offload.async_lookup import (
+                UNCONSUMED_HOLD_FRACTION,
+                ThreadedLookupClient,
+            )
+
+            # The workers' LMCache engines build their pin monitor from this
+            # same environment, so this is the timeout the pins live under.
+            max_hold_s = float(cfg.pin_timeout_sec) * UNCONSUMED_HOLD_FRACTION
+            lookup_client = ThreadedLookupClient(lookup_client, max_hold_s=max_hold_s)
+            logger.info(
+                "LMCache offload scheduler: lookups run on a background thread "
+                "(OFFLOAD_LOOKUP_THREAD); unconsumed answers released after %.0fs",
+                max_hold_s,
             )
 
         super().__init__(
